@@ -1,0 +1,178 @@
+From 765f887bbf0138bd25309806fd56d11d989d3cec Mon Sep 17 00:00:00 2001
+From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
+Date: Tue, 17 Mar 2026 11:23:44 +0100
+Subject: [PATCH] screencast: add source_label and restore_fail_policy to
+ SelectSources
+
+---
+ data/org.freedesktop.portal.ScreenCast.xml | 33 +++++++++-
+ src/screen-cast.c                          | 75 ++++++++++++++++++++--
+ 2 files changed, 101 insertions(+), 7 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.ScreenCast.xml b/data/org.freedesktop.portal.ScreenCast.xml
+index 8233242..e303422 100644
+--- a/data/org.freedesktop.portal.ScreenCast.xml
++++ b/data/org.freedesktop.portal.ScreenCast.xml
+@@ -25,7 +25,7 @@
+ 
+       The Screen cast portal allows to create screen cast sessions.
+ 
+-      This documentation describes version 5 of this interface.
++      This documentation describes version 6 of this interface.
+   -->
+   <interface name="org.freedesktop.portal.ScreenCast">
+     <!--
+@@ -145,6 +145,30 @@
+ 
+           This option was added in version 4 of this interface.
+ 
++        * ``source_label`` (``s``)
++
++          A human-readable label for this source request. An optional hint
++          provided by the application to identify the purpose or origin of
++          this SelectSources call. If supported by the portal backend, this
++          string should be surfaced in the source picker dialog. Backends
++          that do not support this key must ignore it. This option was added
++          in version 6 of this interface.
++
++        * ``restore_fail_policy`` (``u``)
++
++          Determines what the portal does when a restore_token is provided
++          but the session cannot be restored. Allowed values:
++
++          - ``0`` - prompt (default): show the source picker as if no token was
++            provided. This is the default and preserves current behaviour.
++          - ``1`` - skip: do not show the picker; return response=1 via the
++            Request::Response signal.
++          - ``2`` - error: do not show the picker; return response=2 with
++            restore_failed=true in the results vardict.
++
++          Has no effect if no restore_token is provided. This option was
++          added in version 6 of this interface.
++
+         For available source types, see the AvailableSourceTypes property.
+     -->
+     <method name="SelectSources">
+@@ -241,6 +265,13 @@
+           org.freedesktop.portal.ScreenCast.SelectSources() for details.
+ 
+           This response option was added in version 4 of this interface.
++
++        * ``restore_failed`` (``b``)
++
++          Present and set to true when response is 2 and the failure was
++          caused specifically by an inability to honour a provided
++          restore_token combined with restore_fail_policy set to 2.
++          This result was added in version 6 of this interface.
+     -->
+     <method name="Start">
+       <arg type="o" name="session_handle" direction="in"/>
+diff --git a/src/screen-cast.c b/src/screen-cast.c
+index 562d53a..932353b 100644
+--- a/src/screen-cast.c
++++ b/src/screen-cast.c
+@@ -423,12 +423,32 @@ validate_persist_mode (const char *key,
+   return TRUE;
+ }
+ 
++static gboolean
++validate_restore_fail_policy (const char *key,
++                              GVariant *value,
++                              GVariant *options,
++                              GError **error)
++{
++  guint32 policy = g_variant_get_uint32 (value);
++
++  if (policy > 2)
++    {
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
++                   "Invalid restore_fail_policy value: %u", policy);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
+ static XdpOptionKey screen_cast_select_sources_options[] = {
+   { "types", G_VARIANT_TYPE_UINT32, validate_source_types },
+   { "multiple", G_VARIANT_TYPE_BOOLEAN, NULL },
+   { "cursor_mode", G_VARIANT_TYPE_UINT32, validate_cursor_mode },
+   { "restore_token", G_VARIANT_TYPE_STRING, validate_restore_token },
+   { "persist_mode", G_VARIANT_TYPE_UINT32, validate_persist_mode },
++  { "source_label", G_VARIANT_TYPE_STRING, NULL },
++  { "restore_fail_policy", G_VARIANT_TYPE_UINT32, validate_restore_fail_policy },
+ };
+ 
+ static gboolean
+@@ -586,11 +606,54 @@ handle_select_sources (XdpDbusScreenCast *object,
+    * permission store and / or the GHashTable with transient permissions.
+    * Portal implementations do not have access to the restore token.
+    */
+-  if (!replace_screen_cast_restore_token_with_data (session, &options, &error))
+-    {
+-      g_dbus_method_invocation_return_gerror (invocation, error);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
+-    }
++  {
++    gboolean had_restore_token;
++    guint32 restore_fail_policy = 0;
++
++    had_restore_token = xdp_variant_contains_key (options, "restore_token");
++
++    g_variant_lookup (options, "restore_fail_policy", "u", &restore_fail_policy);
++    if (restore_fail_policy > 2)
++      restore_fail_policy = 0;
++
++    if (!replace_screen_cast_restore_token_with_data (session, &options, &error))
++      {
++        g_dbus_method_invocation_return_gerror (invocation, error);
++        return G_DBUS_METHOD_INVOCATION_HANDLED;
++      }
++
++    if (had_restore_token &&
++        !xdp_variant_contains_key (options, "restore_data") &&
++        restore_fail_policy != 0)
++      {
++        guint response;
++        g_auto(GVariantBuilder) results_builder =
++          G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE_VARDICT);
++
++        if (restore_fail_policy == 1)
++          {
++            response = 1;
++          }
++        else
++          {
++            response = 2;
++            g_variant_builder_add (&results_builder, "{sv}",
++                                   "restore_failed",
++                                   g_variant_new_boolean (TRUE));
++          }
++
++        xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
++                                         response,
++                                         g_variant_builder_end (&results_builder));
++        xdp_request_unexport (request);
++
++        if (IS_SCREEN_CAST_SESSION (session))
++          xdp_session_close (session, TRUE);
++
++        xdp_dbus_screen_cast_complete_select_sources (object, invocation, request->id);
++        return G_DBUS_METHOD_INVOCATION_HANDLED;
++      }
++  }
+ 
+   g_object_set_qdata_full (G_OBJECT (request),
+                            quark_request_session,
+@@ -1070,7 +1133,7 @@ on_supported_cursor_modes_changed (GObject *gobject,
+ static void
+ screen_cast_init (ScreenCast *screen_cast)
+ {
+-  xdp_dbus_screen_cast_set_version (XDP_DBUS_SCREEN_CAST (screen_cast), 5);
++  xdp_dbus_screen_cast_set_version (XDP_DBUS_SCREEN_CAST (screen_cast), 6);
+ 
+   g_signal_connect (impl, "notify::supported-source-types",
+                     G_CALLBACK (on_supported_source_types_changed),
+-- 
+2.53.0
+

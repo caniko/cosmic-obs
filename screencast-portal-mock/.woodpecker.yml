@@ -1,0 +1,22 @@
+when:
+  - event: [push, pull_request]
+
+steps:
+  - name: fmt
+    image: rust:latest
+    commands:
+      - rustup component add rustfmt
+      - cargo fmt --check
+
+  - name: clippy
+    image: rust:latest
+    commands:
+      - apt-get update -qq && apt-get install -y -qq dbus libdbus-1-dev pkg-config > /dev/null
+      - rustup component add clippy
+      - cargo clippy -- -D warnings
+
+  - name: test
+    image: rust:latest
+    commands:
+      - apt-get update -qq && apt-get install -y -qq dbus dbus-daemon libdbus-1-dev pkg-config > /dev/null
+      - cargo test

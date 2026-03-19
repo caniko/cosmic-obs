@@ -1,0 +1,81 @@
+From c90d74367a0c740ae990a65adb8c9833072ed3a9 Mon Sep 17 00:00:00 2001
+From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
+Date: Tue, 17 Mar 2026 09:50:14 +0100
+Subject: [PATCH] screencast: display source_label in share picker
+
+---
+ src/portals/Screencopy.cpp      | 7 ++++++-
+ src/shared/ScreencopyShared.cpp | 4 +++-
+ src/shared/ScreencopyShared.hpp | 2 +-
+ 3 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/src/portals/Screencopy.cpp b/src/portals/Screencopy.cpp
+index c74699b..cc7930f 100644
+--- a/src/portals/Screencopy.cpp
++++ b/src/portals/Screencopy.cpp
+@@ -97,6 +97,8 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
+         } geometry;
+     } restoreData;
+ 
++    std::string sourceLabel;
++
+     for (auto& [key, val] : options) {
+ 
+         if (key == "cursor_mode") {
+@@ -175,6 +177,9 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
+         } else if (key == "persist_mode") {
+             PSESSION->persistMode = val.get<uint32_t>();
+             Debug::log(LOG, "[screencopy] option persist_mode to {}", PSESSION->persistMode);
++        } else if (key == "source_label") {
++            sourceLabel = val.get<std::string>();
++            Debug::log(LOG, "[screencopy] option source_label: {}", sourceLabel);
+         } else {
+             Debug::log(LOG, "[screencopy] unused option {}", key);
+         }
+@@ -212,7 +217,7 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
+     } else {
+         Debug::log(LOG, "[screencopy] restore data invalid / missing, prompting");
+ 
+-        SHAREDATA = promptForScreencopySelection();
++        SHAREDATA = promptForScreencopySelection(sourceLabel);
+     }
+ 
+     Debug::log(LOG, "[screencopy] SHAREDATA returned selection {}", (int)SHAREDATA.type);
+diff --git a/src/shared/ScreencopyShared.cpp b/src/shared/ScreencopyShared.cpp
+index c5db2bc..caf55ad 100644
+--- a/src/shared/ScreencopyShared.cpp
++++ b/src/shared/ScreencopyShared.cpp
+@@ -39,7 +39,7 @@ std::string buildWindowList() {
+     return result;
+ }
+ 
+-SSelectionData promptForScreencopySelection() {
++SSelectionData promptForScreencopySelection(const std::string& sourceLabel) {
+     SSelectionData      data;
+ 
+     const char*         WAYLAND_DISPLAY             = getenv("WAYLAND_DISPLAY");
+@@ -60,6 +60,8 @@ SSelectionData promptForScreencopySelection() {
+     proc.addEnv("XCURSOR_SIZE", XCURSOR_SIZE ? XCURSOR_SIZE : "24");
+     proc.addEnv("HYPRLAND_INSTANCE_SIGNATURE", HYPRLAND_INSTANCE_SIGNATURE ? HYPRLAND_INSTANCE_SIGNATURE : "0");
+     proc.addEnv("XDPH_WINDOW_SHARING_LIST", buildWindowList()); // buildWindowList will sanitize any shell stuff in case the picker (qt) does something funky? It shouldn't.
++    if (!sourceLabel.empty())
++        proc.addEnv("XDPH_SOURCE_LABEL", sourceLabel);
+ 
+     if (!proc.runSync())
+         return data;
+diff --git a/src/shared/ScreencopyShared.hpp b/src/shared/ScreencopyShared.hpp
+index 95639c0..4fa6161 100644
+--- a/src/shared/ScreencopyShared.hpp
++++ b/src/shared/ScreencopyShared.hpp
+@@ -43,7 +43,7 @@ struct SSelectionData {
+ 
+ struct wl_buffer;
+ 
+-SSelectionData   promptForScreencopySelection();
++SSelectionData   promptForScreencopySelection(const std::string& sourceLabel = "");
+ uint32_t         drmFourccFromSHM(wl_shm_format format);
+ spa_video_format pwFromDrmFourcc(uint32_t format);
+ wl_shm_format    wlSHMFromDrmFourcc(uint32_t format);
+-- 
+2.53.0
+

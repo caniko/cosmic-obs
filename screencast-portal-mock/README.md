@@ -1,0 +1,103 @@
+# screencast-portal-mock
+
+A mock implementation of the [XDG Desktop Portal](https://flatpak.github.io/xdg-desktop-portal/)
+`org.freedesktop.portal.ScreenCast` interface, running on a private D-Bus session bus.
+
+Built for testing portal clients — especially the two new options proposed in the
+ScreenCast portal **RFC v6**:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `source_label` | `string` | Human-readable hint identifying the application-level source |
+| `restore_fail_policy` | `u32` | What to do when a restore token fails: `0` = prompt, `1` = skip, `2` = error |
+
+## Quick start
+
+Add to your `Cargo.toml`:
+
+```toml
+[dev-dependencies]
+screencast-portal-mock = "0.1"
+tokio = { version = "1", features = ["full", "test-util"] }
+```
+
+Write a test:
+
+```rust
+use screencast_portal_mock::{MockPortal, NormalSession, PrivateBus};
+
+#[tokio::test]
+async fn smoke_test() {
+    // Spawn an isolated dbus-daemon
+    let bus = PrivateBus::spawn().await.unwrap();
+
+    // Start the mock portal with a scenario
+    let handle = MockPortal::start(&bus, NormalSession).await.unwrap();
+
+    // Connect your client to bus.address() and make portal calls...
+    // Then assert on what the mock recorded:
+    handle.assert_call_count(0); // no SelectSources calls yet
+}
+```
+
+## Scenarios
+
+Scenarios control how the mock portal responds. Implement the `Scenario` trait
+for custom behaviour, or use one of the built-in scenarios:
+
+| Scenario | Behaviour |
+|----------|-----------|
+| `NormalSession` | Everything succeeds with defaults (one 1920×1080 stream) |
+| `UserCancels` | `Start` returns `response=1` (user cancelled) |
+| `RestoreTokenValid` | Restore succeeds; `Start` returns a restore token |
+| `RestoreTokenFails` | `SelectSources` returns a restore failure |
+| `MultiSource` | `Start` returns multiple streams |
+| `SlowResponse` | Wraps another scenario, adding a configurable delay |
+| `OldPortal` | Reports a lower interface version (for backward-compat testing) |
+
+### Custom scenario
+
+```rust
+use async_trait::async_trait;
+use screencast_portal_mock::scenario::{ExtraResults, Options, Scenario, StartResult};
+
+pub struct MyScenario;
+
+#[async_trait]
+impl Scenario for MyScenario {
+    async fn on_start(&self, _options: &Options) -> StartResult {
+        // Return a custom response
+        StartResult {
+            response: 0,
+            results: Default::default(),
+        }
+    }
+}
+```
+
+## Assertions
+
+`MockPortalHandle` records every `SelectSources` call and provides assertion
+helpers:
+
+- `assert_call_count(n)` — exactly `n` calls were recorded
+- `assert_source_label(index, label)` — call at `index` has the given label
+- `assert_no_source_label(index)` — call at `index` has no label
+- `assert_restore_fail_policy(index, policy)` — call at `index` has the given policy
+- `assert_no_prompts()` — no call used `restore_fail_policy = Prompt`
+- `wait_for_calls(n, timeout)` — async wait until `n` calls are recorded
+- `calls()` — snapshot of all recorded calls
+
+## Requirements
+
+- **Linux** with D-Bus (a `dbus-daemon` binary must be available)
+- Rust 1.85+ (edition 2024)
+
+## License
+
+Licensed under either of
+
+- [Apache License, Version 2.0](LICENSE-APACHE)
+- [MIT License](LICENSE-MIT)
+
+at your option.
