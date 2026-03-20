@@ -1,7 +1,7 @@
 From 1c857c7e08e7ecc1fcb4caacb69913d7997971bc Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Tue, 17 Mar 2026 09:57:35 +0100
-Subject: [PATCH] linux-pipewire: send source_label and restore_fail_policy to
+Subject: [PATCH] linux-pipewire: send source_label and restore_fail_mode to
  portal
 
 ---
@@ -33,7 +33,7 @@ index d5fe531..97ad686 100644
  
 +	if (response == 1 && capture->restore_token && *capture->restore_token) {
 +		blog(LOG_WARNING,
-+		     "[pipewire] Restore token could not be honoured and restore_fail_policy=skip was set; "
++		     "[pipewire] Restore token could not be honoured and restore_fail_mode=skip was set; "
 +		     "source selection skipped");
 +		return;
 +	}
@@ -52,7 +52,7 @@ index d5fe531..97ad686 100644
 +					      g_variant_new_string(source_name));
 +
 +		if (capture->restore_token && *capture->restore_token)
-+			g_variant_builder_add(&builder, "{sv}", "restore_fail_policy",
++			g_variant_builder_add(&builder, "{sv}", "restore_fail_mode",
 +					      g_variant_new_uint32(1));
 +	}
 +

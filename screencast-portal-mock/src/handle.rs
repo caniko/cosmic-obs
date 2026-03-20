@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::records::{Call, RestoreFailPolicy};
+use crate::records::{Call, RestoreFailMode};
 
 /// Errors from waiting on mock portal state.
 #[derive(Debug, thiserror::Error)]
@@ -86,22 +86,22 @@ impl MockPortalHandle {
         );
     }
 
-    /// Assert that call at `index` has the given `restore_fail_policy`.
+    /// Assert that call at `index` has the given `restore_fail_mode`.
     ///
     /// # Panics
     /// Panics if the policy does not match.
-    pub fn assert_restore_fail_policy(&self, index: usize, expected: RestoreFailPolicy) {
+    pub fn assert_restore_fail_mode(&self, index: usize, expected: RestoreFailMode) {
         let calls = self.calls.lock().expect("calls mutex poisoned");
         let call = &calls[index];
         assert_eq!(
-            call.restore_fail_policy,
+            call.restore_fail_mode,
             Some(expected),
-            "call[{index}] restore_fail_policy mismatch"
+            "call[{index}] restore_fail_mode mismatch"
         );
     }
 
     /// Assert that no recorded calls triggered a user prompt
-    /// (i.e. none have `restore_fail_policy == Some(Prompt)` with a restore failure).
+    /// (i.e. none have `restore_fail_mode == Some(Prompt)` with a restore failure).
     ///
     /// This is a lightweight check: it verifies that no call explicitly set
     /// the policy to `Prompt`. For full prompt detection you would need the
@@ -110,9 +110,9 @@ impl MockPortalHandle {
         let calls = self.calls.lock().expect("calls mutex poisoned");
         for (i, call) in calls.iter().enumerate() {
             assert_ne!(
-                call.restore_fail_policy,
-                Some(RestoreFailPolicy::Prompt),
-                "call[{i}] had restore_fail_policy=Prompt"
+                call.restore_fail_mode,
+                Some(RestoreFailMode::Prompt),
+                "call[{i}] had restore_fail_mode=Prompt"
             );
         }
     }

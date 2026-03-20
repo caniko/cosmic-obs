@@ -114,6 +114,13 @@
               inherit cargoArtifacts;
               cargoClippyExtraArgs = "-- -D warnings";
             });
+
+          # Verify that RFC patches still apply cleanly to upstream packages.
+          # Each of these builds the patched package; a failing patch = a failing check.
+          xdp-patch-applies = import ./nix/xdg-desktop-portal.nix {inherit pkgs;};
+          libportal-patch-applies = import ./nix/libportal.nix {inherit pkgs;};
+          xdph-patch-applies = import ./nix/xdph.nix {inherit pkgs;};
+          cosmic-patch-applies = import ./nix/xdg-desktop-portal-cosmic.nix {inherit pkgs;};
         };
 
         devShells.default = craneLib.devShell {

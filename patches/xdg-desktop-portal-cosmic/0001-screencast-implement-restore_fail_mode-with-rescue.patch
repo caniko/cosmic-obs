@@ -7,7 +7,7 @@ Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 When a restore token resolves to restore_data but the target window is
-not yet running, the backend now checks restore_fail_policy:
+not yet running, the backend now checks restore_fail_mode:
 
   policy 0 (prompt): show picker dialog as before
   policy 1 (skip):   register rescue hook — wait indefinitely for
@@ -33,7 +33,7 @@ XWayland windows without WM_CLASS.
 Restore data bumped from version 1 to 2 to store app_ids, titles, and
 rescue_modes. V1 data deserializes with empty vecs (exact-only matching).
 
-Also adds source_label and restore_fail_policy to SelectSourcesOptions,
+Also adds source_label and restore_fail_mode to SelectSourcesOptions,
 and bumps the backend interface version from 4 to 5.
 ---
  i18n/en/xdg_desktop_portal_cosmic.ftl |   3 +
@@ -281,7 +281,7 @@ index b31f604..0668b25 100644
      // Default: 0
      persist_mode: Option<u32>,
 +    source_label: Option<String>,
-+    restore_fail_policy: Option<u32>,
++    restore_fail_mode: Option<u32>,
  }
  
  #[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
@@ -298,7 +298,7 @@ index b31f604..0668b25 100644
      source_types: BitFlags<SourceType>,
      persisted_capture_sources: Option<PersistedCaptureSources>,
 +    source_label: Option<String>,
-+    restore_fail_policy: u32,
++    restore_fail_mode: u32,
      closed: bool,
  }
  
@@ -307,8 +307,8 @@ index b31f604..0668b25 100644
                      }
                  }
 +                session_data.source_label = options.source_label;
-+                session_data.restore_fail_policy =
-+                    options.restore_fail_policy.unwrap_or(0).min(2);
++                session_data.restore_fail_mode =
++                    options.restore_fail_mode.unwrap_or(0).min(2);
                  PortalResponse::Success(HashMap::new())
              }
              None => PortalResponse::Other,
@@ -323,7 +323,7 @@ index b31f604..0668b25 100644
 +                source_types,
 +                persisted_capture_sources,
 +                source_label,
-+                restore_fail_policy,
++                restore_fail_mode,
 +            ) = {
                  let session_data = interface.get_mut().await;
                  let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_HIDDEN);
@@ -331,14 +331,14 @@ index b31f604..0668b25 100644
                  let source_types = session_data.source_types;
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
 +                let source_label = session_data.source_label.clone();
-+                let restore_fail_policy = session_data.restore_fail_policy;
++                let restore_fail_mode = session_data.restore_fail_mode;
                  (
                      cursor_mode,
                      multiple,
                      source_types,
                      persisted_capture_sources,
 +                    source_label,
-+                    restore_fail_policy,
++                    restore_fail_mode,
                  )
              };
  
@@ -354,12 +354,12 @@ index b31f604..0668b25 100644
 +                // Immediate restore succeeded
                  capture_sources
 +            } else if let Some(persisted) = &persisted_capture_sources {
-+                match restore_fail_policy {
++                match restore_fail_mode {
 +                    1 | 2 => {
 +                        // Rescue: register hook and wait for window to appear
 +                        log::info!(
 +                            "restore failed, policy={}, registering rescue hook (source_label={:?})",
-+                            restore_fail_policy,
++                            restore_fail_mode,
 +                            source_label,
 +                        );
 +                        let rx = self.wayland_helper.register_rescue(persisted.clone());
@@ -379,10 +379,10 @@ index b31f604..0668b25 100644
 +                                Err(_) => {
 +                                    // Sender dropped — session closed or rescue cancelled
 +                                    log::info!(
-+                                        "rescue cancelled, applying restore_fail_policy={}",
-+                                        restore_fail_policy,
++                                        "rescue cancelled, applying restore_fail_mode={}",
++                                        restore_fail_mode,
 +                                    );
-+                                    if restore_fail_policy == 1 {
++                                    if restore_fail_mode == 1 {
 +                                        return PortalResponse::Cancelled;
 +                                    } else {
 +                                        return PortalResponse::OtherWithResults(StartResult {

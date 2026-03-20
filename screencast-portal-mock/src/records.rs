@@ -22,7 +22,7 @@ pub struct RestoreFailure {
 /// Controls behaviour when a restore token cannot be honoured (RFC v6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-pub enum RestoreFailPolicy {
+pub enum RestoreFailMode {
     /// Show the picker dialog (default, backward-compatible).
     Prompt = 0,
     /// Fire `Response(1, {})` — skip without prompting.
@@ -31,20 +31,20 @@ pub enum RestoreFailPolicy {
     Error = 2,
 }
 
-/// Error returned when converting an invalid `u32` to [`RestoreFailPolicy`].
+/// Error returned when converting an invalid `u32` to [`RestoreFailMode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("invalid restore_fail_policy value: {0}")]
-pub struct InvalidRestoreFailPolicy(pub u32);
+#[error("invalid restore_fail_mode value: {0}")]
+pub struct InvalidRestoreFailMode(pub u32);
 
-impl TryFrom<u32> for RestoreFailPolicy {
-    type Error = InvalidRestoreFailPolicy;
+impl TryFrom<u32> for RestoreFailMode {
+    type Error = InvalidRestoreFailMode;
 
     fn try_from(v: u32) -> Result<Self, <Self as TryFrom<u32>>::Error> {
         match v {
             0 => Ok(Self::Prompt),
             1 => Ok(Self::Skip),
             2 => Ok(Self::Error),
-            other => Err(InvalidRestoreFailPolicy(other)),
+            other => Err(InvalidRestoreFailMode(other)),
         }
     }
 }
@@ -70,7 +70,7 @@ pub struct Call {
     pub persist_mode: u32,
     pub restore_token: Option<String>,
     pub source_label: Option<String>,
-    pub restore_fail_policy: Option<RestoreFailPolicy>,
+    pub restore_fail_mode: Option<RestoreFailMode>,
     pub raw_options: HashMap<String, OwnedValue>,
 }
 

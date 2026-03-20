@@ -1,7 +1,7 @@
 From 607ccbc2a243a924e406c6063990191ac330a9d6 Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Tue, 17 Mar 2026 09:43:37 +0100
-Subject: [PATCH] remote: add source_label and restore_fail_policy to
+Subject: [PATCH] remote: add source_label and restore_fail_mode to
  screencast API
 
 ---
@@ -18,7 +18,7 @@ index a0da823..bf5d673 100644
    XdpPersistMode persist_mode;
    char *restore_token;
 +  char *source_label;
-+  XdpRestoreFailPolicy restore_fail_policy;
++  XdpRestoreFailMode restore_fail_mode;
    gboolean multiple;
    guint signal_id;
    GTask *task;
@@ -38,7 +38,7 @@ index a0da823..bf5d673 100644
 +    {
 +      if (call->source_label)
 +        g_variant_builder_add (&options, "{sv}", "source_label", g_variant_new_string (call->source_label));
-+      g_variant_builder_add (&options, "{sv}", "restore_fail_policy", g_variant_new_uint32 (call->restore_fail_policy));
++      g_variant_builder_add (&options, "{sv}", "restore_fail_mode", g_variant_new_uint32 (call->restore_fail_mode));
 +    }
    g_dbus_connection_call (call->portal->bus,
                            PORTAL_BUS_NAME,
@@ -55,7 +55,7 @@ index a0da823..bf5d673 100644
 +                                             persist_mode,
 +                                             restore_token,
 +                                             NULL,
-+                                             XDP_RESTORE_FAIL_POLICY_PROMPT,
++                                             XDP_RESTORE_FAIL_MODE_PROMPT,
 +                                             cancellable,
 +                                             callback,
 +                                             data);
@@ -70,7 +70,7 @@ index a0da823..bf5d673 100644
 + * @persist_mode: the persist mode of the session
 + * @restore_token: (nullable): the token of a previous screencast session to restore
 + * @source_label: (nullable): a human-readable label for the source
-+ * @restore_fail_policy: the policy when a restore token cannot be honoured
++ * @restore_fail_mode: the policy when a restore token cannot be honoured
 + * @cancellable: (nullable): optional [class@Gio.Cancellable]
 + * @callback: (scope async): a callback to call when the request is done
 + * @data: data to pass to @callback
@@ -78,7 +78,7 @@ index a0da823..bf5d673 100644
 + * Creates a session for a screencast.
 + *
 + * This is the same as [method@Portal.create_screencast_session], but
-+ * additionally allows specifying @source_label and @restore_fail_policy.
++ * additionally allows specifying @source_label and @restore_fail_mode.
 + * These options require portal interface version 6 or later.
 + *
 + * When the request is done, @callback will be called. You can then
@@ -92,7 +92,7 @@ index a0da823..bf5d673 100644
 +                                           XdpPersistMode persist_mode,
 +                                           const char *restore_token,
 +                                           const char *source_label,
-+                                           XdpRestoreFailPolicy restore_fail_policy,
++                                           XdpRestoreFailMode restore_fail_mode,
 +                                           GCancellable *cancellable,
 +                                           GAsyncReadyCallback  callback,
 +                                           gpointer data)
@@ -104,7 +104,7 @@ index a0da823..bf5d673 100644
    call->persist_mode = persist_mode;
    call->restore_token = g_strdup (restore_token);
 +  call->source_label = g_strdup (source_label);
-+  call->restore_fail_policy = restore_fail_policy;
++  call->restore_fail_mode = restore_fail_mode;
    call->multiple = (flags & XDP_SCREENCAST_FLAG_MULTIPLE) != 0;
    call->task = g_task_new (portal, cancellable, callback, data);
  
@@ -117,19 +117,19 @@ index e5e75cb..0646967 100644
  } XdpPersistMode;
  
 +/**
-+ * XdpRestoreFailPolicy:
-+ * @XDP_RESTORE_FAIL_POLICY_PROMPT: Show the source picker (default).
-+ * @XDP_RESTORE_FAIL_POLICY_SKIP: Return cancelled without prompting.
-+ * @XDP_RESTORE_FAIL_POLICY_ERROR: Return error with restore_failed flag.
++ * XdpRestoreFailMode:
++ * @XDP_RESTORE_FAIL_MODE_PROMPT: Show the source picker (default).
++ * @XDP_RESTORE_FAIL_MODE_SKIP: Return cancelled without prompting.
++ * @XDP_RESTORE_FAIL_MODE_ERROR: Return error with restore_failed flag.
 + *
 + * Determines what happens when a restore token cannot be honoured.
 + * Requires portal interface version 6 or later.
 + */
 +typedef enum {
-+  XDP_RESTORE_FAIL_POLICY_PROMPT = 0,
-+  XDP_RESTORE_FAIL_POLICY_SKIP   = 1,
-+  XDP_RESTORE_FAIL_POLICY_ERROR  = 2,
-+} XdpRestoreFailPolicy;
++  XDP_RESTORE_FAIL_MODE_PROMPT = 0,
++  XDP_RESTORE_FAIL_MODE_SKIP   = 1,
++  XDP_RESTORE_FAIL_MODE_ERROR  = 2,
++} XdpRestoreFailMode;
 +
  XDP_PUBLIC
  void        xdp_portal_create_screencast_session            (XdpPortal            *portal,
@@ -146,7 +146,7 @@ index e5e75cb..0646967 100644
 +                                                             XdpPersistMode        persist_mode,
 +                                                             const char           *restore_token,
 +                                                             const char           *source_label,
-+                                                             XdpRestoreFailPolicy  restore_fail_policy,
++                                                             XdpRestoreFailMode  restore_fail_mode,
 +                                                             GCancellable         *cancellable,
 +                                                             GAsyncReadyCallback   callback,
 +                                                             gpointer              data);

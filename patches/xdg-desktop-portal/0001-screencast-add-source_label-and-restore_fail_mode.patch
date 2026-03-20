@@ -1,13 +1,13 @@
 From 765f887bbf0138bd25309806fd56d11d989d3cec Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Tue, 17 Mar 2026 11:23:44 +0100
-Subject: [PATCH] screencast: add source_label and restore_fail_policy to
+Subject: [PATCH] screencast: add source_label and restore_fail_mode to
  SelectSources
 
 ---
- data/org.freedesktop.portal.ScreenCast.xml | 33 +++++++++-
+ data/org.freedesktop.portal.ScreenCast.xml | 55 +++++++++++++++++-
  src/screen-cast.c                          | 75 ++++++++++++++++++++--
- 2 files changed, 101 insertions(+), 7 deletions(-)
+ 2 files changed, 123 insertions(+), 7 deletions(-)
 
 diff --git a/data/org.freedesktop.portal.ScreenCast.xml b/data/org.freedesktop.portal.ScreenCast.xml
 index 8233242..e303422 100644
@@ -22,7 +22,7 @@ index 8233242..e303422 100644
    -->
    <interface name="org.freedesktop.portal.ScreenCast">
      <!--
-@@ -145,6 +145,30 @@
+@@ -145,6 +145,59 @@
  
            This option was added in version 4 of this interface.
  
@@ -32,10 +32,20 @@ index 8233242..e303422 100644
 +          provided by the application to identify the purpose or origin of
 +          this SelectSources call. If supported by the portal backend, this
 +          string should be surfaced in the source picker dialog. Backends
-+          that do not support this key must ignore it. This option was added
-+          in version 6 of this interface.
++          that do not support this key must ignore it. Backends SHOULD treat
++          an empty string the same as an absent key.
 +
-+        * ``restore_fail_policy`` (``u``)
++          This string is plain text. Backends MUST NOT interpret it as Pango
++          markup, HTML, or any other rich text format. Backends SHOULD
++          truncate labels exceeding 256 bytes for display. Backends SHOULD
++          strip Unicode control characters (U+0000-U+001F, U+007F,
++          U+200E-U+200F, U+202A-U+202E, U+2066-U+2069) before display.
++          The label is untrusted application-provided input with the same
++          trust model as window titles.
++
++          This option was added in version 6 of this interface.
++
++        * ``restore_fail_mode`` (``u``)
 +
 +          Determines what the portal does when a restore_token is provided
 +          but the session cannot be restored. Allowed values:
@@ -47,26 +57,32 @@ index 8233242..e303422 100644
 +          - ``2`` - error: do not show the picker; return response=2 with
 +            restore_failed=true in the results vardict.
 +
-+          Has no effect if no restore_token is provided. This option was
-+          added in version 6 of this interface.
++          Has no effect if no restore_token is provided. Has no effect on
++          RemoteDesktop sessions, where restore_token is not supported.
 +
-         For available source types, see the AvailableSourceTypes property.
-     -->
-     <method name="SelectSources">
-@@ -241,6 +265,13 @@
-           org.freedesktop.portal.ScreenCast.SelectSources() for details.
- 
-           This response option was added in version 4 of this interface.
++          The skip and error modes do not bypass user consent. They only
++          activate when a previously-consented restore_token cannot be
++          honoured. No new source access is granted without user interaction.
++
++          This option was added in version 6 of this interface.
++
++      The following results get returned via the
++      org.freedesktop.portal.Request::Response signal when restore_fail_mode
++      is set to a non-zero value:
 +
 +        * ``restore_failed`` (``b``)
 +
 +          Present and set to true when response is 2 and the failure was
 +          caused specifically by an inability to honour a provided
-+          restore_token combined with restore_fail_policy set to 2.
++          restore_token combined with restore_fail_mode set to 2.
++          Applications receiving this result SHOULD discard the stale
++          restore_token and either re-initiate SelectSources without a
++          token (to trigger the picker) or defer to a user action.
 +          This result was added in version 6 of this interface.
++
+         For available source types, see the AvailableSourceTypes property.
      -->
-     <method name="Start">
-       <arg type="o" name="session_handle" direction="in"/>
+     <method name="SelectSources">
 diff --git a/src/screen-cast.c b/src/screen-cast.c
 index 562d53a..932353b 100644
 --- a/src/screen-cast.c
@@ -76,7 +92,7 @@ index 562d53a..932353b 100644
  }
  
 +static gboolean
-+validate_restore_fail_policy (const char *key,
++validate_restore_fail_mode (const char *key,
 +                              GVariant *value,
 +                              GVariant *options,
 +                              GError **error)
@@ -86,7 +102,7 @@ index 562d53a..932353b 100644
 +  if (policy > 2)
 +    {
 +      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
-+                   "Invalid restore_fail_policy value: %u", policy);
++                   "Invalid restore_fail_mode value: %u", policy);
 +      return FALSE;
 +    }
 +
@@ -100,7 +116,7 @@ index 562d53a..932353b 100644
    { "restore_token", G_VARIANT_TYPE_STRING, validate_restore_token },
    { "persist_mode", G_VARIANT_TYPE_UINT32, validate_persist_mode },
 +  { "source_label", G_VARIANT_TYPE_STRING, NULL },
-+  { "restore_fail_policy", G_VARIANT_TYPE_UINT32, validate_restore_fail_policy },
++  { "restore_fail_mode", G_VARIANT_TYPE_UINT32, validate_restore_fail_mode },
  };
  
  static gboolean
@@ -115,13 +131,13 @@ index 562d53a..932353b 100644
 -    }
 +  {
 +    gboolean had_restore_token;
-+    guint32 restore_fail_policy = 0;
++    guint32 restore_fail_mode = 0;
 +
 +    had_restore_token = xdp_variant_contains_key (options, "restore_token");
 +
-+    g_variant_lookup (options, "restore_fail_policy", "u", &restore_fail_policy);
-+    if (restore_fail_policy > 2)
-+      restore_fail_policy = 0;
++    g_variant_lookup (options, "restore_fail_mode", "u", &restore_fail_mode);
++    if (restore_fail_mode > 2)
++      restore_fail_mode = 0;
 +
 +    if (!replace_screen_cast_restore_token_with_data (session, &options, &error))
 +      {
@@ -131,13 +147,13 @@ index 562d53a..932353b 100644
 +
 +    if (had_restore_token &&
 +        !xdp_variant_contains_key (options, "restore_data") &&
-+        restore_fail_policy != 0)
++        restore_fail_mode != 0)
 +      {
 +        guint response;
 +        g_auto(GVariantBuilder) results_builder =
 +          G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE_VARDICT);
 +
-+        if (restore_fail_policy == 1)
++        if (restore_fail_mode == 1)
 +          {
 +            response = 1;
 +          }

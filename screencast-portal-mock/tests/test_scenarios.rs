@@ -118,7 +118,7 @@ async fn restore_token_invalid_prompt() {
 
     let session = helpers::create_session(&client).await;
 
-    // No restore_fail_policy => defaults to Prompt => response=0
+    // No restore_fail_mode => defaults to Prompt => response=0
     let mut opts = std::collections::HashMap::new();
     opts.insert(
         "restore_token".into(),

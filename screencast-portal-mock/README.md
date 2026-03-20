@@ -9,7 +9,7 @@ ScreenCast portal **RFC v6**:
 | Key | Type | Description |
 |-----|------|-------------|
 | `source_label` | `string` | Human-readable hint identifying the application-level source |
-| `restore_fail_policy` | `u32` | What to do when a restore token fails: `0` = prompt, `1` = skip, `2` = error |
+| `restore_fail_mode` | `u32` | What to do when a restore token fails: `0` = prompt, `1` = skip, `2` = error |
 
 ## Quick start
 
@@ -83,8 +83,8 @@ helpers:
 - `assert_call_count(n)` — exactly `n` calls were recorded
 - `assert_source_label(index, label)` — call at `index` has the given label
 - `assert_no_source_label(index)` — call at `index` has no label
-- `assert_restore_fail_policy(index, policy)` — call at `index` has the given policy
-- `assert_no_prompts()` — no call used `restore_fail_policy = Prompt`
+- `assert_restore_fail_mode(index, policy)` — call at `index` has the given policy
+- `assert_no_prompts()` — no call used `restore_fail_mode = Prompt`
 - `wait_for_calls(n, timeout)` — async wait until `n` calls are recorded
 - `calls()` — snapshot of all recorded calls
 

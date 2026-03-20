@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::records::{Call, RestoreFailPolicy, SourceTypes};
+use crate::records::{Call, RestoreFailMode, SourceTypes};
 use crate::scenario::Scenario;
 
 /// Errors from the portal server.
@@ -167,10 +167,10 @@ impl ScreenCastPortal {
             .and_then(|v| v.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
             .map(|s| s.to_string());
 
-        let restore_fail_policy = options
-            .get("restore_fail_policy")
+        let restore_fail_mode = options
+            .get("restore_fail_mode")
             .and_then(|v| <u32>::try_from(v).ok())
-            .and_then(|v| RestoreFailPolicy::try_from(v).ok());
+            .and_then(|v| RestoreFailMode::try_from(v).ok());
 
         let call = Call {
             timestamp: std::time::Instant::now(),
@@ -181,7 +181,7 @@ impl ScreenCastPortal {
             persist_mode,
             restore_token,
             source_label,
-            restore_fail_policy,
+            restore_fail_mode,
             raw_options: options.clone(),
         };
 
@@ -190,7 +190,7 @@ impl ScreenCastPortal {
         let conn = self.conn.clone();
         let scenario = self.scenario.clone();
         let rp = request_path.clone();
-        let policy = restore_fail_policy.unwrap_or(RestoreFailPolicy::Prompt);
+        let policy = restore_fail_mode.unwrap_or(RestoreFailMode::Prompt);
 
         conn.object_server()
             .at(&request_path, RequestObject)
@@ -204,13 +204,13 @@ impl ScreenCastPortal {
                     fire_response(&conn, &rp, 0, extra).await;
                 }
                 Err(_failure) => match policy {
-                    RestoreFailPolicy::Prompt => {
+                    RestoreFailMode::Prompt => {
                         fire_response(&conn, &rp, 0, HashMap::new()).await;
                     }
-                    RestoreFailPolicy::Skip => {
+                    RestoreFailMode::Skip => {
                         fire_response(&conn, &rp, 1, HashMap::new()).await;
                     }
-                    RestoreFailPolicy::Error => {
+                    RestoreFailMode::Error => {
                         let mut results = HashMap::new();
                         results.insert(
                             "restore_failed".into(),
