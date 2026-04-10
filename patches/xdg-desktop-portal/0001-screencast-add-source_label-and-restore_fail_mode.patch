@@ -1,16 +1,16 @@
-From 765f887bbf0138bd25309806fd56d11d989d3cec Mon Sep 17 00:00:00 2001
-From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
-Date: Tue, 17 Mar 2026 11:23:44 +0100
+From cfa28b6513df843dd609d66d4031fdb599c68df1 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Fri, 10 Apr 2026 09:13:31 +0200
 Subject: [PATCH] screencast: add source_label and restore_fail_mode to
  SelectSources
 
 ---
- data/org.freedesktop.portal.ScreenCast.xml | 55 +++++++++++++++++-
- src/screen-cast.c                          | 75 ++++++++++++++++++++--
- 2 files changed, 123 insertions(+), 7 deletions(-)
+ data/org.freedesktop.portal.ScreenCast.xml |  66 ++++++++++++-
+ src/screen-cast.c                          | 103 +++++++++++++++++++--
+ 2 files changed, 162 insertions(+), 7 deletions(-)
 
 diff --git a/data/org.freedesktop.portal.ScreenCast.xml b/data/org.freedesktop.portal.ScreenCast.xml
-index 8233242..e303422 100644
+index 8233242..9371643 100644
 --- a/data/org.freedesktop.portal.ScreenCast.xml
 +++ b/data/org.freedesktop.portal.ScreenCast.xml
 @@ -25,7 +25,7 @@
@@ -22,7 +22,7 @@ index 8233242..e303422 100644
    -->
    <interface name="org.freedesktop.portal.ScreenCast">
      <!--
-@@ -145,6 +145,59 @@
+@@ -145,6 +145,70 @@
  
            This option was added in version 4 of this interface.
  
@@ -80,17 +80,46 @@ index 8233242..e303422 100644
 +          token (to trigger the picker) or defer to a user action.
 +          This result was added in version 6 of this interface.
 +
++      When restore_fail_mode is set to 1 or 2 and the restore_token cannot
++      be honoured, the SelectSources method itself completes normally. The
++      failure is communicated via the Request::Response signal and the
++      session is closed by the portal. Callers MUST subscribe to the
++      Request::Response signal before calling SelectSources to observe
++      these outcomes.
++
++      Portal implementations MUST ignore restore_fail_mode when no
++      restore_token is present in the same SelectSources call.
++
          For available source types, see the AvailableSourceTypes property.
      -->
      <method name="SelectSources">
 diff --git a/src/screen-cast.c b/src/screen-cast.c
-index 562d53a..932353b 100644
+index 562d53a..01930fc 100644
 --- a/src/screen-cast.c
 +++ b/src/screen-cast.c
-@@ -423,12 +423,32 @@ validate_persist_mode (const char *key,
+@@ -423,12 +423,51 @@ validate_persist_mode (const char *key,
    return TRUE;
  }
  
++static gboolean
++validate_source_label (const char *key,
++                       GVariant *value,
++                       GVariant *options,
++                       GError **error)
++{
++  const char *label = g_variant_get_string (value, NULL);
++  gsize len = strlen (label);
++
++  if (len > 256)
++    {
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
++                   "source_label exceeds 256 bytes (%zu)", len);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
 +static gboolean
 +validate_restore_fail_mode (const char *key,
 +                              GVariant *value,
@@ -115,12 +144,12 @@ index 562d53a..932353b 100644
    { "cursor_mode", G_VARIANT_TYPE_UINT32, validate_cursor_mode },
    { "restore_token", G_VARIANT_TYPE_STRING, validate_restore_token },
    { "persist_mode", G_VARIANT_TYPE_UINT32, validate_persist_mode },
-+  { "source_label", G_VARIANT_TYPE_STRING, NULL },
++  { "source_label", G_VARIANT_TYPE_STRING, validate_source_label },
 +  { "restore_fail_mode", G_VARIANT_TYPE_UINT32, validate_restore_fail_mode },
  };
  
  static gboolean
-@@ -586,11 +606,54 @@ handle_select_sources (XdpDbusScreenCast *object,
+@@ -586,11 +625,63 @@ handle_select_sources (XdpDbusScreenCast *object,
     * permission store and / or the GHashTable with transient permissions.
     * Portal implementations do not have access to the restore token.
     */
@@ -135,10 +164,15 @@ index 562d53a..932353b 100644
 +
 +    had_restore_token = xdp_variant_contains_key (options, "restore_token");
 +
++    /* validate_restore_fail_mode (option validator) rejects values > 2
++     * before we reach this point, so no clamp is needed here. */
 +    g_variant_lookup (options, "restore_fail_mode", "u", &restore_fail_mode);
-+    if (restore_fail_mode > 2)
-+      restore_fail_mode = 0;
 +
++    /* Note: had_restore_token is captured before replace_screen_cast_restore_token_with_data
++     * mutates options. The three outcomes (error/restored/stale) all produce correct
++     * behaviour with the captured value: on error we return early; on successful restore
++     * the "restore_data" key is added; on a stale token neither "restore_token" nor
++     * "restore_data" is set, which is exactly when had_restore_token triggers fail_mode. */
 +    if (!replace_screen_cast_restore_token_with_data (session, &options, &error))
 +      {
 +        g_dbus_method_invocation_return_gerror (invocation, error);
@@ -170,6 +204,10 @@ index 562d53a..932353b 100644
 +                                         g_variant_builder_end (&results_builder));
 +        xdp_request_unexport (request);
 +
++        /* Session close is best-effort: xdp_session_close returns void.
++         * If the underlying D-Bus proxy call fails, the session state is
++         * already unusable from the caller's perspective (they received
++         * the fail response), so best-effort matches the existing semantics. */
 +        if (IS_SCREEN_CAST_SESSION (session))
 +          xdp_session_close (session, TRUE);
 +
@@ -180,7 +218,7 @@ index 562d53a..932353b 100644
  
    g_object_set_qdata_full (G_OBJECT (request),
                             quark_request_session,
-@@ -1070,7 +1133,7 @@ on_supported_cursor_modes_changed (GObject *gobject,
+@@ -1070,7 +1161,7 @@ on_supported_cursor_modes_changed (GObject *gobject,
  static void
  screen_cast_init (ScreenCast *screen_cast)
  {
