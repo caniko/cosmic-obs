@@ -1,20 +1,46 @@
 From 1c857c7e08e7ecc1fcb4caacb69913d7997971bc Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Tue, 17 Mar 2026 09:57:35 +0100
-Subject: [PATCH] linux-pipewire: send source_label and restore_fail_mode to
- portal
+Subject: [PATCH] linux-pipewire: send source_label and restore_fail_mode, and
+ expose RestoreFailMode property
 
+Adds the v6 ScreenCast portal extensions to the OBS pipewire capture:
+
+  * source_label: derived from obs_source_get_name(), sent only on
+    portal v6+.
+  * restore_fail_mode: exposed as a new "RestoreFailMode" source
+    property (Prompt=0 / Skip=1 / Error=2, default Skip to preserve
+    existing behaviour).
+
+Recovery from a stale restore_token is handled entirely by the portal:
+when the caller selects Prompt mode the portal either shows the picker
+or (on Cosmic) holds the session open and pushes a late response=0 once
+the target window reappears. OBS does not retry SelectSources itself.
+
+TODO: add locale strings in plugins/linux-pipewire/data/locale/en-US.ini
+  RestoreFailMode="On restore failure"
+  RestoreFailMode.Prompt="Prompt user"
+  RestoreFailMode.Skip="Skip silently"
+  RestoreFailMode.Error="Report error"
 ---
- plugins/linux-pipewire/screencast-portal.c | 26 +++++++++++++++++++++-
- 1 file changed, 25 insertions(+), 1 deletion(-)
+ plugins/linux-pipewire/screencast-portal.c | 32 ++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
 
 diff --git a/plugins/linux-pipewire/screencast-portal.c b/plugins/linux-pipewire/screencast-portal.c
 index d5fe531..97ad686 100644
 --- a/plugins/linux-pipewire/screencast-portal.c
 +++ b/plugins/linux-pipewire/screencast-portal.c
-@@ -224,7 +224,13 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
+@@ -57,6 +57,7 @@
+
+ 	obs_pipewire *obs_pw;
+ 	obs_pipewire_stream *obs_pw_stream;
++	uint32_t restore_fail_mode;
+ };
+
+ /* ------------------------------------------------- */
+@@ -224,7 +225,13 @@
  	g_variant_get(parameters, "(u@a{sv})", &response, &result);
- 
+
  	if (response != 0) {
 -		blog(LOG_WARNING, "[pipewire] Failed to start screencast, denied or cancelled by user");
 +		gboolean restore_failed = FALSE;
@@ -26,25 +52,11 @@ index d5fe531..97ad686 100644
 +			blog(LOG_WARNING, "[pipewire] Failed to start screencast, denied or cancelled by user");
  		return;
  	}
- 
-@@ -319,6 +325,13 @@ static void on_select_source_response_received_cb(GVariant *parameters, void *us
- 
- 	g_variant_get(parameters, "(u@a{sv})", &response, &ret);
- 
-+	if (response == 1 && capture->restore_token && *capture->restore_token) {
-+		blog(LOG_WARNING,
-+		     "[pipewire] Restore token could not be honoured and restore_fail_mode=skip was set; "
-+		     "source selection skipped");
-+		return;
-+	}
-+
- 	if (response != 0) {
- 		blog(LOG_WARNING, "[pipewire] Failed to select source, denied or cancelled by user");
- 		return;
-@@ -377,6 +390,17 @@ static void select_source(struct screencast_portal_capture *capture)
+
+@@ -377,6 +384,17 @@
  		}
  	}
- 
+
 +	if (get_screencast_version() >= 6) {
 +		const char *source_name = obs_source_get_name(capture->source);
 +		if (source_name && *source_name)
@@ -53,12 +65,65 @@ index d5fe531..97ad686 100644
 +
 +		if (capture->restore_token && *capture->restore_token)
 +			g_variant_builder_add(&builder, "{sv}", "restore_fail_mode",
-+					      g_variant_new_uint32(1));
++					      g_variant_new_uint32(capture->restore_fail_mode));
 +	}
 +
  	g_dbus_proxy_call(get_screencast_portal_proxy(), "SelectSources",
  			  g_variant_new("(oa{sv})", capture->session_handle, &builder), G_DBUS_CALL_FLAGS_NONE, -1,
  			  capture->cancellable, on_source_selected_cb, NULL);
--- 
-2.53.0
+@@ -517,6 +535,7 @@
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_MONITOR;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->restore_fail_mode = (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+ 	capture->source = source;
 
+ 	init_screencast_capture(capture);
+@@ -531,6 +550,7 @@
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_WINDOW;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->restore_fail_mode = (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+ 	capture->source = source;
+
+ 	init_screencast_capture(capture);
+@@ -546,6 +566,7 @@
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_UNIFIED;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->restore_fail_mode = (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+ 	capture->source = source;
+
+ 	init_screencast_capture(capture);
+@@ -588,6 +609,7 @@
+ {
+ 	obs_data_set_default_bool(settings, "ShowCursor", true);
+ 	obs_data_set_default_string(settings, "RestoreToken", NULL);
++	obs_data_set_default_int(settings, "RestoreFailMode", 1);
+ }
+
+ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
+@@ -614,6 +636,13 @@
+ 	obs_properties_add_button2(properties, "Reload", obs_module_text(reload_string_id), reload_session_cb, capture);
+ 	obs_properties_add_bool(properties, "ShowCursor", obs_module_text("ShowCursor"));
+
++	obs_property_t *mode_prop = obs_properties_add_list(properties, "RestoreFailMode",
++							    obs_module_text("RestoreFailMode"), OBS_COMBO_TYPE_LIST,
++							    OBS_COMBO_FORMAT_INT);
++	obs_property_list_add_int(mode_prop, obs_module_text("RestoreFailMode.Prompt"), 0);
++	obs_property_list_add_int(mode_prop, obs_module_text("RestoreFailMode.Skip"), 1);
++	obs_property_list_add_int(mode_prop, obs_module_text("RestoreFailMode.Error"), 2);
++
+ 	return properties;
+ }
+
+@@ -622,6 +651,7 @@
+ 	struct screencast_portal_capture *capture = data;
+
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
++	capture->restore_fail_mode = (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+
+ 	if (capture->obs_pw_stream)
+ 		obs_pipewire_stream_set_cursor_visible(capture->obs_pw_stream, capture->cursor_visible);
+--
+2.53.0
