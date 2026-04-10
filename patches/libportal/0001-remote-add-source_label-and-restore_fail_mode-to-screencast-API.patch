@@ -1,16 +1,16 @@
-From 607ccbc2a243a924e406c6063990191ac330a9d6 Mon Sep 17 00:00:00 2001
-From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
-Date: Tue, 17 Mar 2026 09:43:37 +0100
-Subject: [PATCH] remote: add source_label and restore_fail_mode to
- screencast API
+From 6301617e8cf8a859dca241f464045b8ca35ed41a Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Fri, 10 Apr 2026 09:34:53 +0200
+Subject: [PATCH] remote: add source_label and restore_fail_mode to screencast
+ API
 
 ---
- libportal/remote.c | 60 ++++++++++++++++++++++++++++++++++++++++++++++
- libportal/remote.h | 28 ++++++++++++++++++++++
- 2 files changed, 88 insertions(+)
+ libportal/remote.c | 96 ++++++++++++++++++++++++++++++++++++++++++++++
+ libportal/remote.h | 28 ++++++++++++++
+ 2 files changed, 124 insertions(+)
 
 diff --git a/libportal/remote.c b/libportal/remote.c
-index a0da823..bf5d673 100644
+index a0da823..86e0856 100644
 --- a/libportal/remote.c
 +++ b/libportal/remote.c
 @@ -34,6 +34,8 @@ typedef struct {
@@ -36,7 +36,7 @@ index a0da823..bf5d673 100644
      }
 +  if (call->portal->screencast_interface_version >= 6)
 +    {
-+      if (call->source_label)
++      if (call->source_label && *call->source_label)
 +        g_variant_builder_add (&options, "{sv}", "source_label", g_variant_new_string (call->source_label));
 +      g_variant_builder_add (&options, "{sv}", "restore_fail_mode", g_variant_new_uint32 (call->restore_fail_mode));
 +    }
@@ -99,17 +99,53 @@ index a0da823..bf5d673 100644
  {
    CreateCall *call;
  
-@@ -467,6 +525,8 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
+@@ -467,6 +525,44 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
    call->cursor_mode = cursor_mode;
    call->persist_mode = persist_mode;
    call->restore_token = g_strdup (restore_token);
-+  call->source_label = g_strdup (source_label);
-+  call->restore_fail_mode = restore_fail_mode;
++
++  /* 5B: normalize empty source_label to NULL (spec: treat empty as absent). */
++  if (source_label != NULL && *source_label != '\0')
++    {
++      /* 5A: truncate to 256 bytes on a UTF-8 char boundary. */
++      gsize len = strlen (source_label);
++      if (len > 256)
++        {
++          g_warning ("source_label exceeds 256 bytes (%zu), truncating", len);
++          /* g_utf8_find_prev_char walks back to a valid char boundary. */
++          const char *end = source_label + 256;
++          const char *safe = g_utf8_find_prev_char (source_label, end);
++          if (safe != NULL && safe >= source_label)
++            call->source_label = g_strndup (source_label, safe - source_label);
++          else
++            call->source_label = g_strndup (source_label, 256);
++        }
++      else
++        {
++          call->source_label = g_strdup (source_label);
++        }
++    }
++  else
++    {
++      call->source_label = NULL;
++    }
++
++  /* 5A: clamp restore_fail_mode to valid range. */
++  if (restore_fail_mode > XDP_RESTORE_FAIL_MODE_ERROR)
++    {
++      g_warning ("restore_fail_mode %u out of range, clamping to PROMPT (0)",
++                 restore_fail_mode);
++      call->restore_fail_mode = XDP_RESTORE_FAIL_MODE_PROMPT;
++    }
++  else
++    {
++      call->restore_fail_mode = restore_fail_mode;
++    }
    call->multiple = (flags & XDP_SCREENCAST_FLAG_MULTIPLE) != 0;
    call->task = g_task_new (portal, cancellable, callback, data);
  
 diff --git a/libportal/remote.h b/libportal/remote.h
-index e5e75cb..0646967 100644
+index e5e75cb..ff4699d 100644
 --- a/libportal/remote.h
 +++ b/libportal/remote.h
 @@ -110,6 +110,21 @@ typedef enum {
