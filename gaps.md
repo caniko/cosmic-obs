@@ -154,6 +154,15 @@ destroys them. Scene reload, plugin restart, profile switch → transform lost.
 struct, re-apply on reconnect. Or mark source "pending reconnect" to prevent
 teardown.
 
+**Resolution (2026-04-10): closed — category error.** `screencast-portal.c`
+owns only `obs_source_t` + PipeWire stream; scene items and their transforms
+live in scene data and are persisted by OBS independently. On skip the source
+stays alive, the scene item stays alive, and the transform remains in the
+scene file. Scene reload / plugin restart / profile switch all recreate the
+source from `settings` (including `RestoreToken`) and hit the same
+SelectSources path — no separate transform-snapshot layer is needed or
+possible from this file. No code change.
+
 ### 3B. No retry after skip
 
 **File:** `patches/obs-studio/screencast-portal.c`
@@ -165,6 +174,31 @@ OBS has already given up.
 **Fix:** Keep session alive, retry `SelectSources` with backoff. Or rely on
 Cosmic rescue (mode=1 → Cosmic waits → late response=0).
 
+**Resolution (2026-04-10): closed — push, not retry.** Correct architecture
+is portal→OBS push, not OBS→portal poll. Two distinct paths cover the cases:
+
+1. **Permission store has data but windows are stale** — xdp passes
+   `restore_data` to Cosmic. Cosmic's `check_or_rescue` in the Start handler
+   registers a rescue hook and awaits a oneshot channel that the Wayland
+   toplevel event handler fires when the target window reappears. From OBS's
+   perspective this is a single `Start` call whose `Response` signal arrives
+   late — no retry logic, no extra subscriptions, no client-side timer.
+   Delayed-rescue semantics tested by the new `DelayedRestore` mock scenario
+   and `test_rescue_delayed.rs`.
+
+2. **Permission store entry is gone entirely** — xdp itself fires `response=1`
+   on the `SelectSources` request and closes the session. There is nothing
+   for the portal to push: no `restore_data`, no windows to wait for, no
+   useful delayed response. The existing OBS skip branch correctly abandons
+   the session. The user resolves this by clicking **Reload** or reopening
+   the source (which calls `SelectSources` without a token).
+
+No client-side retry added. `on_select_source_response_received_cb`
+keeps the existing upstream `response != 0` branch: log and return,
+identical to the user-denied path. Recovery is entirely the portal's
+job — either via the picker (Prompt + non-rescue backend) or via a
+late `Start` response (Prompt + Cosmic rescue).
+
 ### 3C. `restore_fail_mode` hardcoded to 1
 
 **File:** `patches/obs-studio/screencast-portal.c:56`
@@ -173,6 +207,16 @@ OBS always sends `restore_fail_mode=1` (skip). No way to opt into error (2)
 or prompt (0) per-source. Error mode is dead code from OBS's perspective.
 
 **Fix:** OBS source property (dropdown: prompt/skip/error). Default skip.
+
+**Resolution (2026-04-10): implemented.** A new `RestoreFailMode` source
+property is now exposed via `obs_properties_add_list` with integer values
+(Prompt=0, Skip=1, Error=2). The value is stored on `capture->restore_fail_mode`
+in each `*_create` function and refreshed in `screencast_portal_capture_update`.
+Defaults set via `obs_data_set_default_int(settings, "RestoreFailMode", 1)`
+preserve existing behaviour on upgrade. `select_source()` reads the field
+when assembling the v6 options vardict. Locale strings
+(`RestoreFailMode`, `RestoreFailMode.Prompt`, `.Skip`, `.Error`) are listed
+as a TODO in the patch header for the separate en-US.ini update.
 
 ### 3D. GVariant leak on skip path
 
@@ -190,6 +234,13 @@ if (response == 1 && capture->restore_token && *capture->restore_token) {
 
 **Fix:** `g_variant_unref(ret)` before return, or `g_autoptr(GVariant)`.
 
+**Resolution (2026-04-10): closed — non-bug.** Upstream already declares
+`ret` as `g_autoptr(GVariant)` (see `on_select_source_response_received_cb`
+in `plugins/linux-pipewire/screencast-portal.c`). GLib's auto-cleanup fires
+on every scope exit, including the early return added by the patch. The
+original analysis misread the surrounding upstream code. Adding an explicit
+`g_variant_unref` would be a double-free. No code change.
+
 ### 3E. `restore_fail_mode` without `restore_token` undefined
 
 **File:** `patches/obs-studio/screencast-portal.c:54–56`
@@ -201,6 +252,14 @@ effect if no restore_token is provided" but no code enforces this.
 **Fix:** Portal-side: ignore `restore_fail_mode` when no restore_token
 present (xdp already does this via `had_restore_token` check). Document the
 contract explicitly in the XML.
+
+**Resolution (2026-04-10): closed — already enforced.** Two layers already
+guarantee the contract: (1) the OBS patch guards the
+`g_variant_builder_add` call behind
+`if (capture->restore_token && *capture->restore_token)` — so OBS never
+sends `restore_fail_mode` without a token; (2) xdg-desktop-portal validates
+via `had_restore_token` (see §4B). No additional OBS-side code required.
+Documenting the cross-layer contract is a spec/XML task covered by §7A.
 
 ---
 
@@ -384,7 +443,21 @@ Currently only tested: ASCII labels.
 
 ### Mock: rescue-like scenario (2 tests)
 
-- `8V` `DelayedRestore` scenario: `on_select_sources` returns `Err`, then
-  fires late response=0 from background task after delay. Simulates rescue.
+- `8V` Portal→caller push model. **Implemented in two complementary ways:**
+  - `DelayedRestore` scenario (`src/scenario.rs`) + `test_rescue_delayed.rs`:
+    sleep-based smoke test. Models the Cosmic rescue as a `tokio::sleep`
+    inside `on_start`. Cheap but only covers the happy path.
+  - `ExternallyTriggeredRescue` + `RescueController` (`src/scenario.rs`)
+    + `test_rescue_controlled.rs`: deterministic control. `on_start`
+    awaits a `tokio::sync::oneshot::Receiver` whose sender lives in the
+    test. Covers success, `trigger_fail(1)`, `trigger_fail(2)`, and
+    cancel-by-drop — the last of which the sleep model could never
+    exercise. Five tests total.
+
+  No Scenario trait signature change was needed. The existing
+  `tokio::spawn` + `on_start().await` shape in `src/portal.rs:249` already
+  holds the Response signal for the full duration of the scenario future,
+  which exactly mirrors the real Cosmic rescue loop.
+
 - `8W` Multiple stale-token sessions pending simultaneously with different
   policies.

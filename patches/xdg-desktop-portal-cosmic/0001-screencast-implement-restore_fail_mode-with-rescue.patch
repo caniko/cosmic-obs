@@ -46,10 +46,10 @@ Improvements over initial RFC draft:
 ---
  i18n/en/xdg_desktop_portal_cosmic.ftl |   3 +
  src/main.rs                           |   4 +
- src/screencast.rs                     | 298 ++++++++++++++++++++++++--
+ src/screencast.rs                     | 300 ++++++++++++++++++++++++--
  src/screencast_dialog.rs              | 112 ++++++++--
  src/wayland/mod.rs                    |  64 ++++++
- 5 files changed, 446 insertions(+), 35 deletions(-)
+ 5 files changed, 448 insertions(+), 35 deletions(-)
 
 diff --git a/i18n/en/xdg_desktop_portal_cosmic.ftl b/i18n/en/xdg_desktop_portal_cosmic.ftl
 index 5e6fe12..351bc1c 100644
@@ -390,17 +390,19 @@ index b31f604..8d589d7 100644
  pub struct ScreenCast {
      wayland_helper: WaylandHelper,
      tx: Sender<subscription::Event>,
-@@ -223,6 +390,9 @@ impl ScreenCast {
+@@ -223,6 +390,11 @@ impl ScreenCast {
                          log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
                      }
                  }
 +                session_data.source_label = sanitize_label(options.source_label);
-+                session_data.restore_fail_mode =
-+                    options.restore_fail_mode.unwrap_or(0).min(2);
++                session_data.restore_fail_mode = options
++                    .restore_fail_mode
++                    .filter(|v| *v <= 2)
++                    .unwrap_or(0);
                  PortalResponse::Success(HashMap::new())
              }
              None => PortalResponse::Other,
-@@ -246,17 +416,28 @@ impl ScreenCast {
+@@ -246,17 +418,28 @@ impl ScreenCast {
                  return PortalResponse::Other;
              };
  
@@ -430,7 +432,7 @@ index b31f604..8d589d7 100644
                  )
              };
  
-@@ -268,11 +449,74 @@ impl ScreenCast {
+@@ -268,11 +451,74 @@ impl ScreenCast {
              }
  
              let capture_sources = if let Some(capture_sources) =
@@ -507,7 +509,7 @@ index b31f604..8d589d7 100644
                  let resp = screencast_dialog::show_screencast_prompt(
                      &self.tx,
                      &session_handle,
-@@ -372,15 +616,27 @@ impl ScreenCast {
+@@ -372,15 +618,27 @@ impl ScreenCast {
                  .collect();
              interface.get_mut().await.screencast_threads = screencast_threads;
  
@@ -535,7 +537,7 @@ index b31f604..8d589d7 100644
              })
          })
          .await
-@@ -399,6 +655,6 @@ impl ScreenCast {
+@@ -399,6 +657,6 @@ impl ScreenCast {
  
      #[zbus(property, name = "version")]
      async fn version(&self) -> u32 {

@@ -34,6 +34,7 @@ pub use records::{
     Call, RestoreFailMode, RestoreFailReason, RestoreFailure, SourceDef, SourceTypes,
 };
 pub use scenario::{
-    ErrorWithoutFlag, FailThenSucceed, MultiSource, NormalSession, OldPortal, Options,
-    RestoreTokenFails, RestoreTokenValid, Scenario, SlowResponse, StartResult, UserCancels,
+    DelayedRestore, ErrorWithoutFlag, ExternallyTriggeredRescue, FailThenSucceed, MultiSource,
+    NormalSession, OldPortal, Options, RescueController, RescueOutcome, RestoreTokenFails,
+    RestoreTokenValid, Scenario, SlowResponse, StartResult, UserCancels,
 };

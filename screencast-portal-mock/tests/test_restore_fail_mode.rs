@@ -225,7 +225,10 @@ async fn all_fail_reasons_with_error_policy() {
         let session = helpers::create_session(&client).await;
 
         let (resp, results) = helpers::select_sources(&client, &session, policy_options(2)).await;
-        assert_eq!(resp, 2, "error policy should fire response=2 for {reason:?}");
+        assert_eq!(
+            resp, 2,
+            "error policy should fire response=2 for {reason:?}"
+        );
         assert!(
             bool::try_from(results.get("restore_failed").unwrap()).unwrap(),
             "restore_failed should be true for {reason:?}"

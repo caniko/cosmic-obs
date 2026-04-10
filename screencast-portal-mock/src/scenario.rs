@@ -47,7 +47,7 @@ pub trait Scenario: Send + Sync + 'static {
 
 /// Build the default `StartResult`: response=0, one 1920x1080 stream with node_id=1.
 #[must_use]
-fn default_start_result() -> StartResult {
+pub(crate) fn default_start_result() -> StartResult {
     let streams = encode_streams(&[SourceDef::monitor(1)]);
     let mut results = HashMap::new();
     results.insert("streams".into(), streams);
@@ -245,6 +245,37 @@ impl Scenario for FailThenSucceed {
     }
 }
 
+/// Simulates a Cosmic-style server-side rescue: the first `on_select_sources`
+/// appears to fail (returns `Err`) but `on_start` later succeeds with the given
+/// delay. This models a portal that holds the session open while waiting for a
+/// missing window to reappear, then fires the late Start response.
+///
+/// Use this to verify caller behaviour when a stale restore_token is honoured
+/// asynchronously after an initial skip would otherwise have fired.
+pub struct DelayedRestore {
+    pub rescue_delay: Duration,
+    pub reason: RestoreFailReason,
+}
+
+#[async_trait]
+impl Scenario for DelayedRestore {
+    async fn on_select_sources(&self, _options: &Options) -> Result<ExtraResults, RestoreFailure> {
+        // Report the token failure — the portal layer will convert this into
+        // the appropriate response according to the caller's restore_fail_mode.
+        // For rescue semantics the caller is expected to send mode=Prompt, so
+        // the portal fires response=0 and SelectSources appears to succeed;
+        // the rescue delay is then paid during `on_start`.
+        Err(RestoreFailure {
+            reason: self.reason,
+        })
+    }
+
+    async fn on_start(&self, _options: &Options) -> StartResult {
+        tokio::time::sleep(self.rescue_delay).await;
+        default_start_result()
+    }
+}
+
 /// `on_start` returns response=2 with empty results (no `restore_failed` key).
 /// This simulates an error response that lacks the expected flag.
 pub struct ErrorWithoutFlag;
@@ -255,6 +286,128 @@ impl Scenario for ErrorWithoutFlag {
         StartResult {
             response: 2,
             results: HashMap::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Externally-triggered rescue — deterministic portal→caller push model
+// ---------------------------------------------------------------------------
+//
+// `DelayedRestore` above fakes the Cosmic rescue hook by sleeping inside
+// `on_start`. That works but leaves three gaps: sleep-based assertions are
+// flaky, rescue cancellation can't be driven from a test, and failure
+// responses (rescue timed out / rescue resolved to error) can't be expressed.
+//
+// `ExternallyTriggeredRescue` models the real shape: `on_start` awaits a
+// oneshot channel whose sender (`RescueController`) lives in the test. The
+// test triggers rescue success, failure, or cancellation at a deterministic
+// point and asserts on the resulting Start response.
+
+/// Outcome the test drives into a pending rescue.
+#[derive(Debug)]
+pub enum RescueOutcome {
+    /// Rescue succeeded — Start fires `response=0` with the default stream.
+    Succeed,
+    /// Rescue succeeded with a custom `StartResult` (multi-stream tests,
+    /// explicit `restore_failed` flag, etc.).
+    SucceedWith(StartResult),
+    /// Rescue resolved to failure — Start fires the given response code
+    /// (1 = cancelled, 2 = error) with empty results.
+    Fail { response: u32 },
+}
+
+/// Test-side handle for triggering an in-flight rescue.
+///
+/// Dropping the controller without triggering is equivalent to
+/// `Fail { response: 1 }` — matches the "session closed mid-rescue"
+/// semantics of the real Cosmic portal where a dropped `oneshot::Sender`
+/// in `pending_rescues` ends the rescue with a cancelled response.
+#[must_use = "Drop the controller or call a trigger method to resolve the rescue"]
+pub struct RescueController {
+    tx: tokio::sync::oneshot::Sender<RescueOutcome>,
+}
+
+impl RescueController {
+    /// Fire the default success `StartResult` (one 1920x1080 stream).
+    pub fn trigger_succeed(self) {
+        let _ = self.tx.send(RescueOutcome::Succeed);
+    }
+
+    /// Fire a custom success payload.
+    pub fn trigger_succeed_with(self, result: StartResult) {
+        let _ = self.tx.send(RescueOutcome::SucceedWith(result));
+    }
+
+    /// Fire a failure response (1 = cancelled, 2 = error) with empty results.
+    pub fn trigger_fail(self, response: u32) {
+        let _ = self.tx.send(RescueOutcome::Fail { response });
+    }
+}
+
+/// Scenario whose `on_start` blocks on an externally-triggered rescue.
+///
+/// `on_select_sources` returns `Err(RestoreFailure)` so that under
+/// `restore_fail_mode=Prompt` the portal converts it to `response=0` and
+/// the caller proceeds to Start, where the rescue await happens. Pair with
+/// `RescueController` to drive the rescue outcome from the test.
+///
+/// Pair this scenario with its controller via [`Self::new`]; the returned
+/// tuple lets the test destructure the controller before moving the
+/// scenario into the mock portal.
+pub struct ExternallyTriggeredRescue {
+    rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<RescueOutcome>>>,
+    pub reason: RestoreFailReason,
+}
+
+impl ExternallyTriggeredRescue {
+    /// Build a paired scenario and controller.
+    ///
+    /// The scenario is passed to [`crate::MockPortal::start`] while the
+    /// controller is retained by the test to drive rescue timing.
+    pub fn new(reason: RestoreFailReason) -> (Self, RescueController) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                rx: tokio::sync::Mutex::new(Some(rx)),
+                reason,
+            },
+            RescueController { tx },
+        )
+    }
+}
+
+#[async_trait]
+impl Scenario for ExternallyTriggeredRescue {
+    async fn on_select_sources(&self, _options: &Options) -> Result<ExtraResults, RestoreFailure> {
+        Err(RestoreFailure {
+            reason: self.reason,
+        })
+    }
+
+    async fn on_start(&self, _options: &Options) -> StartResult {
+        // Take the receiver exactly once. If portal.rs ever grows a retry
+        // path this will panic, which is the correct failure mode: tests
+        // should create a fresh scenario per retry.
+        let rx = {
+            let mut guard = self.rx.lock().await;
+            guard
+                .take()
+                .expect("ExternallyTriggeredRescue::on_start called twice")
+        };
+
+        match rx.await {
+            Ok(RescueOutcome::Succeed) => default_start_result(),
+            Ok(RescueOutcome::SucceedWith(r)) => r,
+            Ok(RescueOutcome::Fail { response }) => StartResult {
+                response,
+                results: HashMap::new(),
+            },
+            Err(_) => StartResult {
+                // Controller dropped without triggering → cancelled.
+                response: 1,
+                results: HashMap::new(),
+            },
         }
     }
 }
