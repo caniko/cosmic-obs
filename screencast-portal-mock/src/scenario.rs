@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -205,5 +206,55 @@ pub struct OldPortal {
 impl Scenario for OldPortal {
     fn version(&self) -> u32 {
         self.version
+    }
+}
+
+/// Fails the first `on_select_sources` call, succeeds on subsequent calls.
+/// Uses an `AtomicUsize` counter to track invocation count.
+pub struct FailThenSucceed {
+    counter: AtomicUsize,
+}
+
+impl FailThenSucceed {
+    /// Create a new `FailThenSucceed` scenario.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            counter: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Default for FailThenSucceed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Scenario for FailThenSucceed {
+    async fn on_select_sources(&self, _options: &Options) -> Result<ExtraResults, RestoreFailure> {
+        let call_num = self.counter.fetch_add(1, Ordering::SeqCst);
+        if call_num == 0 {
+            Err(RestoreFailure {
+                reason: RestoreFailReason::TokenNotFound,
+            })
+        } else {
+            Ok(HashMap::new())
+        }
+    }
+}
+
+/// `on_start` returns response=2 with empty results (no `restore_failed` key).
+/// This simulates an error response that lacks the expected flag.
+pub struct ErrorWithoutFlag;
+
+#[async_trait]
+impl Scenario for ErrorWithoutFlag {
+    async fn on_start(&self, _options: &Options) -> StartResult {
+        StartResult {
+            response: 2,
+            results: HashMap::new(),
+        }
     }
 }

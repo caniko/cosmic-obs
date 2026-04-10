@@ -1,6 +1,6 @@
-From 2d1489c59817486250754cc1440355721ff6ac6d Mon Sep 17 00:00:00 2001
+From 28bd7caaaf932bfaf112ef291aebbc1b32823f98 Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
-Date: Wed, 18 Mar 2026 17:30:05 +0100
+Date: Fri, 3 Apr 2026 17:02:28 +0200
 Subject: [PATCH] screencast: zero-cost rescue with user-chosen matching mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -10,7 +10,7 @@ When a restore token resolves to restore_data but the target window is
 not yet running, the backend now checks restore_fail_mode:
 
   policy 0 (prompt): show picker dialog as before
-  policy 1 (skip):   register rescue hook — wait indefinitely for
+  policy 1 (skip):   register rescue hook — wait up to 30s for
                       the window to appear; if session closed, cancel
   policy 2 (error):  same as skip, but return restore_failed=true on
                       session close
@@ -31,17 +31,25 @@ user-chosen mode. Empty app_id guards prevent false positives for
 XWayland windows without WM_CLASS.
 
 Restore data bumped from version 1 to 2 to store app_ids, titles, and
-rescue_modes. V1 data deserializes with empty vecs (exact-only matching).
+rescue_modes. V1 data deserializes with padded vecs (exact-only matching).
 
 Also adds source_label and restore_fail_mode to SelectSourcesOptions,
-and bumps the backend interface version from 4 to 5.
+and bumps the backend interface version from 4 to 6.
+
+Improvements over initial RFC draft:
+- source_label sanitized: control chars stripped, 256-byte truncation
+- V1/V2 parallel vec lengths validated at deserialization
+- Rescue check-and-register is atomic (no TOCTOU race)
+- Pending rescues capped at 64 (prevents resource exhaustion)
+- Rescue timeout: 30 seconds (prevents indefinite hangs)
+- Bounds-safe indexing for rescue mode updates in dialog
 ---
  i18n/en/xdg_desktop_portal_cosmic.ftl |   3 +
  src/main.rs                           |   4 +
- src/screencast.rs                     | 238 ++++++++++++++++++++++++--
- src/screencast_dialog.rs              | 110 ++++++++++--
- src/wayland/mod.rs                    |  49 ++++++
- 5 files changed, 371 insertions(+), 33 deletions(-)
+ src/screencast.rs                     | 298 ++++++++++++++++++++++++--
+ src/screencast_dialog.rs              | 112 ++++++++--
+ src/wayland/mod.rs                    |  64 ++++++
+ 5 files changed, 446 insertions(+), 35 deletions(-)
 
 diff --git a/i18n/en/xdg_desktop_portal_cosmic.ftl b/i18n/en/xdg_desktop_portal_cosmic.ftl
 index 5e6fe12..351bc1c 100644
@@ -77,10 +85,27 @@ index 7ef3cf4..f762e6d 100644
      }
  }
 diff --git a/src/screencast.rs b/src/screencast.rs
-index b31f604..0668b25 100644
+index b31f604..8d589d7 100644
 --- a/src/screencast.rs
 +++ b/src/screencast.rs
-@@ -26,16 +26,25 @@ struct CreateSessionResult {
+@@ -2,7 +2,7 @@
+ 
+ use ashpd::{desktop::screencast::SourceType, enumflags2::BitFlags};
+ use futures::stream::{FuturesOrdered, StreamExt};
+-use std::{collections::HashMap, mem};
++use std::{collections::HashMap, mem, time::Duration};
+ use tokio::sync::mpsc::Sender;
+ use zbus::zvariant;
+ 
+@@ -10,6 +10,7 @@ use crate::screencast_dialog::{self, CaptureSources};
+ use crate::screencast_thread::ScreencastThread;
+ use crate::subscription;
+ use crate::wayland::{CaptureSource, WaylandHelper};
++use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
+ use crate::{PortalResponse, Request};
+ 
+ const CURSOR_MODE_HIDDEN: u32 = 1;
+@@ -26,16 +27,25 @@ struct CreateSessionResult {
      session_id: String,
  }
  
@@ -108,7 +133,7 @@ index b31f604..0668b25 100644
      ) -> Option<Self> {
          let mut outputs = Vec::new();
          for handle in &sources.outputs {
-@@ -44,18 +53,28 @@ impl PersistedCaptureSources {
+@@ -44,33 +54,117 @@ impl PersistedCaptureSources {
          }
  
          let mut toplevels = Vec::new();
@@ -125,24 +150,38 @@ index b31f604..0668b25 100644
          }
  
 -        Some(Self { outputs, toplevels })
++        let mut rescue_modes = rescue_modes.to_vec();
++        rescue_modes.resize(toplevels.len(), RESCUE_MODE_APP);
++
 +        Some(Self {
 +            outputs,
 +            toplevels,
 +            toplevel_app_ids,
 +            toplevel_titles,
-+            rescue_modes: rescue_modes.to_vec(),
++            rescue_modes,
 +        })
++    }
++
++    pub(crate) fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
++        let toplevel_infos = wayland_helper.toplevels();
++        self.to_capture_sources_with(&toplevel_infos, wayland_helper)
      }
  
 -    fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
-+    pub(crate) fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
++    pub(crate) fn to_capture_sources_with(
++        &self,
++        toplevel_infos: &[ToplevelInfo],
++        wayland_helper: &WaylandHelper,
++    ) -> Option<CaptureSources> {
          let mut outputs = Vec::new();
          for name in &self.outputs {
              outputs.push(wayland_helper.output_for_name(name)?);
-@@ -63,14 +82,68 @@ impl PersistedCaptureSources {
+         }
  
++        // All-or-nothing: if any toplevel fails to match, return None
++        // and discard the (local) partial results.
          let mut toplevels = Vec::new();
-         let toplevel_infos = wayland_helper.toplevels();
+-        let toplevel_infos = wayland_helper.toplevels();
 -        for identifier in &self.toplevels {
 -            let info = toplevel_infos
 -                .iter()
@@ -161,6 +200,7 @@ index b31f604..0668b25 100644
 +
 +            // Mode 0 (Exact): no fallback
 +            if mode == RESCUE_MODE_EXACT {
++                log::debug!("restore: exact match failed for identifier={}", identifier);
 +                return None;
 +            }
 +
@@ -183,12 +223,17 @@ index b31f604..0668b25 100644
 +                        && toplevel_infos.iter().any(|ti| ti.app_id == *aid)
 +                    {
 +                        log::debug!(
-+                            "rescue: app_id={} matched but title={:?} did not",
++                            "restore: app_id={} matched but title={:?} did not",
 +                            aid,
 +                            title,
 +                        );
 +                    }
 +                }
++                log::debug!(
++                    "restore: title match failed for app_id={:?} title={:?}",
++                    app_id,
++                    title,
++                );
 +                return None;
 +            }
 +
@@ -202,6 +247,7 @@ index b31f604..0668b25 100644
 +                }
 +            }
 +
++            log::debug!("restore: app match failed for app_id={:?}", app_id);
 +            return None;
          }
  
@@ -214,7 +260,7 @@ index b31f604..0668b25 100644
      }
  }
  
-@@ -86,10 +159,13 @@ impl From<PersistedCaptureSources> for RestoreData {
+@@ -86,10 +180,13 @@ impl From<PersistedCaptureSources> for RestoreData {
      fn from(sources: PersistedCaptureSources) -> RestoreData {
          RestoreData {
              vendor: "COSMIC".to_string(),
@@ -229,7 +275,7 @@ index b31f604..0668b25 100644
              )))
              .try_to_owned()
              .unwrap(),
-@@ -100,12 +176,42 @@ impl From<PersistedCaptureSources> for RestoreData {
+@@ -100,12 +197,50 @@ impl From<PersistedCaptureSources> for RestoreData {
  impl TryFrom<&RestoreData> for PersistedCaptureSources {
      type Error = ();
      fn try_from(restore_data: &RestoreData) -> Result<Self, ()> {
@@ -247,11 +293,12 @@ index b31f604..0668b25 100644
 +                // V1: only outputs and toplevels — degrade to exact-only matching
 +                let (outputs, toplevels): (Vec<String>, Vec<String>) =
 +                    structure.try_into().map_err(|_| ())?;
++                let tl_len = toplevels.len();
 +                Ok(PersistedCaptureSources {
 +                    outputs,
-+                    toplevel_app_ids: Vec::new(),
-+                    toplevel_titles: Vec::new(),
-+                    rescue_modes: Vec::new(),
++                    toplevel_app_ids: vec![String::new(); tl_len],
++                    toplevel_titles: vec![String::new(); tl_len],
++                    rescue_modes: vec![RESCUE_MODE_EXACT; tl_len],
 +                    toplevels,
 +                })
 +            }
@@ -263,6 +310,13 @@ index b31f604..0668b25 100644
 +                    Vec<String>,
 +                    Vec<u32>,
 +                ) = structure.try_into().map_err(|_| ())?;
++                let tl_len = toplevels.len();
++                if toplevel_app_ids.len() != tl_len
++                    || toplevel_titles.len() != tl_len
++                    || rescue_modes.len() != tl_len
++                {
++                    return Err(());
++                }
 +                Ok(PersistedCaptureSources {
 +                    outputs,
 +                    toplevels,
@@ -276,7 +330,7 @@ index b31f604..0668b25 100644
      }
  }
  
-@@ -122,6 +228,8 @@ struct SelectSourcesOptions {
+@@ -122,6 +257,8 @@ struct SelectSourcesOptions {
      restore_data: Option<RestoreData>,
      // Default: 0
      persist_mode: Option<u32>,
@@ -285,7 +339,7 @@ index b31f604..0668b25 100644
  }
  
  #[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
-@@ -140,6 +248,7 @@ struct StartResult {
+@@ -140,6 +277,7 @@ struct StartResult {
      streams: Vec<(u32, StreamProps)>,
      persist_mode: Option<u32>,
      restore_data: Option<RestoreData>,
@@ -293,7 +347,7 @@ index b31f604..0668b25 100644
  }
  
  #[derive(Default)]
-@@ -149,6 +258,8 @@ struct SessionData {
+@@ -149,6 +287,8 @@ struct SessionData {
      multiple: bool,
      source_types: BitFlags<SourceType>,
      persisted_capture_sources: Option<PersistedCaptureSources>,
@@ -302,17 +356,51 @@ index b31f604..0668b25 100644
      closed: bool,
  }
  
-@@ -223,6 +334,9 @@ impl ScreenCast {
+@@ -161,6 +301,33 @@ impl SessionData {
+     }
+ }
+ 
++/// Sanitize a user-provided label per the ScreenCast v6 spec:
++/// strip control characters, truncate to 256 bytes, normalize empty to None.
++fn sanitize_label(input: Option<String>) -> Option<String> {
++    let s = input?;
++    let cleaned: String = s.chars().filter(|c| !is_label_control_char(*c)).collect();
++    if cleaned.is_empty() {
++        return None;
++    }
++    if cleaned.len() <= 256 {
++        return Some(cleaned);
++    }
++    let mut end = 256;
++    while !cleaned.is_char_boundary(end) {
++        end -= 1;
++    }
++    Some(cleaned[..end].to_string())
++}
++
++fn is_label_control_char(c: char) -> bool {
++    matches!(c,
++        '\u{0000}'..='\u{001F}' | '\u{007F}' |
++        '\u{200E}'..='\u{200F}' |
++        '\u{202A}'..='\u{202E}' |
++        '\u{2066}'..='\u{2069}'
++    )
++}
++
+ pub struct ScreenCast {
+     wayland_helper: WaylandHelper,
+     tx: Sender<subscription::Event>,
+@@ -223,6 +390,9 @@ impl ScreenCast {
                          log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
                      }
                  }
-+                session_data.source_label = options.source_label;
++                session_data.source_label = sanitize_label(options.source_label);
 +                session_data.restore_fail_mode =
 +                    options.restore_fail_mode.unwrap_or(0).min(2);
                  PortalResponse::Success(HashMap::new())
              }
              None => PortalResponse::Other,
-@@ -246,17 +360,28 @@ impl ScreenCast {
+@@ -246,17 +416,28 @@ impl ScreenCast {
                  return PortalResponse::Other;
              };
  
@@ -342,7 +430,7 @@ index b31f604..0668b25 100644
                  )
              };
  
-@@ -268,11 +393,74 @@ impl ScreenCast {
+@@ -268,11 +449,74 @@ impl ScreenCast {
              }
  
              let capture_sources = if let Some(capture_sources) =
@@ -356,30 +444,30 @@ index b31f604..0668b25 100644
 +            } else if let Some(persisted) = &persisted_capture_sources {
 +                match restore_fail_mode {
 +                    1 | 2 => {
-+                        // Rescue: register hook and wait for window to appear
 +                        log::info!(
-+                            "restore failed, policy={}, registering rescue hook (source_label={:?})",
++                            "restore failed, policy={}, registering rescue (source_label={:?})",
 +                            restore_fail_mode,
 +                            source_label,
 +                        );
-+                        let rx = self.wayland_helper.register_rescue(persisted.clone());
-+
-+                        // Check again — window may have appeared between
-+                        // to_capture_sources and register_rescue
-+                        if let Some(sources) =
-+                            persisted.to_capture_sources(&self.wayland_helper)
-+                        {
-+                            sources
-+                        } else {
-+                            match rx.await {
-+                                Ok(sources) => {
++                        match self.wayland_helper.check_or_rescue(persisted) {
++                            Ok(sources) => sources,
++                            Err(maybe_rx) => {
++                                let rescue_result = match maybe_rx {
++                                    Some(rx) => tokio::time::timeout(
++                                        Duration::from_secs(30),
++                                        rx,
++                                    )
++                                    .await
++                                    .ok()
++                                    .and_then(|r| r.ok()),
++                                    None => None,
++                                };
++                                if let Some(sources) = rescue_result {
 +                                    log::info!("rescue succeeded");
 +                                    sources
-+                                }
-+                                Err(_) => {
-+                                    // Sender dropped — session closed or rescue cancelled
++                                } else {
 +                                    log::info!(
-+                                        "rescue cancelled, applying restore_fail_mode={}",
++                                        "rescue cancelled/failed, applying restore_fail_mode={}",
 +                                        restore_fail_mode,
 +                                    );
 +                                    if restore_fail_mode == 1 {
@@ -419,7 +507,7 @@ index b31f604..0668b25 100644
                  let resp = screencast_dialog::show_screencast_prompt(
                      &self.tx,
                      &session_handle,
-@@ -372,15 +560,27 @@ impl ScreenCast {
+@@ -372,15 +616,27 @@ impl ScreenCast {
                  .collect();
              interface.get_mut().await.screencast_threads = screencast_threads;
  
@@ -447,16 +535,16 @@ index b31f604..0668b25 100644
              })
          })
          .await
-@@ -399,6 +599,6 @@ impl ScreenCast {
+@@ -399,6 +655,6 @@ impl ScreenCast {
  
      #[zbus(property, name = "version")]
      async fn version(&self) -> u32 {
 -        4
-+        5
++        6
      }
  }
 diff --git a/src/screencast_dialog.rs b/src/screencast_dialog.rs
-index 22c33f1..b38365f 100644
+index 22c33f1..f6399bf 100644
 --- a/src/screencast_dialog.rs
 +++ b/src/screencast_dialog.rs
 @@ -22,6 +22,7 @@ use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
@@ -519,7 +607,7 @@ index 22c33f1..b38365f 100644
      Share,
      Cancel,
  }
-@@ -221,11 +234,34 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+@@ -221,11 +234,36 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
                  .position(|t| t == &toplevel)
              {
                  args.capture_sources.toplevels.remove(idx);
@@ -550,11 +638,13 @@ index 22c33f1..b38365f 100644
 +                .iter()
 +                .position(|t| t == &toplevel)
 +            {
-+                args.capture_sources.rescue_modes[idx] = mode;
++                if let Some(slot) = args.capture_sources.rescue_modes.get_mut(idx) {
++                    *slot = mode;
++                }
              }
          }
          Msg::Share => {
-@@ -356,12 +392,15 @@ fn output_button<'a>(
+@@ -356,12 +394,15 @@ fn output_button<'a>(
          .into()
  }
  
@@ -574,7 +664,7 @@ index 22c33f1..b38365f 100644
      let text = widget::text(label).class(theme::style::Text::Custom(|theme| {
          let container = theme.current_container();
          cosmic::iced_core::widget::text::Style {
-@@ -371,19 +410,55 @@ fn toplevel_button(
+@@ -371,19 +412,55 @@ fn toplevel_button(
      let button = widget::button::custom(text)
          .width(iced::Length::Fill)
          .padding(0)
@@ -635,7 +725,7 @@ index 22c33f1..b38365f 100644
  }
  
  pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
-@@ -422,15 +497,22 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+@@ -422,15 +499,22 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
              for (toplevel_info, icon) in &args.toplevels {
                  let icon = IconSource::from_unknown(icon.as_deref().unwrap_or_default());
                  let label = &toplevel_info.title;
@@ -664,7 +754,7 @@ index 22c33f1..b38365f 100644
              }
              if args.toplevels.len() > 8 {
 diff --git a/src/wayland/mod.rs b/src/wayland/mod.rs
-index 15a9536..dd57688 100644
+index 15a9536..02f3509 100644
 --- a/src/wayland/mod.rs
 +++ b/src/wayland/mod.rs
 @@ -24,6 +24,9 @@ use std::{
@@ -677,10 +767,12 @@ index 15a9536..dd57688 100644
  use wayland_client::{
      Connection, Dispatch, QueueHandle, WEnum,
      globals::registry_queue_init,
-@@ -81,12 +84,19 @@ impl DmabufHelper {
+@@ -81,12 +84,21 @@ impl DmabufHelper {
      }
  }
  
++const MAX_PENDING_RESCUES: usize = 64;
++
 +/// A pending rescue waiting for a window to appear.
 +struct PendingRescue {
 +    persisted: PersistedCaptureSources,
@@ -697,7 +789,7 @@ index 15a9536..dd57688 100644
      qh: QueueHandle<AppData>,
      capturer: Capturer,
      wl_shm: wl_shm::WlShm,
-@@ -152,6 +162,26 @@ impl AppData {
+@@ -152,6 +164,26 @@ impl AppData {
  
          *self.wayland_helper.inner.toplevels.lock().unwrap() =
              self.toplevel_info_state.toplevels().cloned().collect();
@@ -724,7 +816,7 @@ index 15a9536..dd57688 100644
      }
  }
  
-@@ -245,6 +275,7 @@ impl WaylandHelper {
+@@ -245,6 +277,7 @@ impl WaylandHelper {
                  output_infos: Mutex::new(HashMap::new()),
                  output_toplevels: Mutex::new(HashMap::new()),
                  toplevels: Mutex::new(Vec::new()),
@@ -732,26 +824,39 @@ index 15a9536..dd57688 100644
                  qh: qh.clone(),
                  capturer: screencopy_state.capturer().clone(),
                  wl_shm: shm_state.wl_shm().clone(),
-@@ -292,6 +323,24 @@ impl WaylandHelper {
+@@ -292,6 +325,37 @@ impl WaylandHelper {
          self.inner.toplevels.lock().unwrap().clone()
      }
  
-+    /// Register a rescue hook. Returns a receiver that fires when a matching
-+    /// window appears. Drop the receiver to cancel. Zero-cost while waiting.
-+    pub fn register_rescue(
++    /// Atomically check if persisted sources can be resolved against current
++    /// toplevels. If not, register a rescue hook in the same lock scope.
++    /// Returns `Ok(sources)` on immediate match, `Err(Some(rx))` if rescue
++    /// was registered, or `Err(None)` if the rescue limit was reached.
++    pub fn check_or_rescue(
 +        &self,
-+        persisted: PersistedCaptureSources,
-+    ) -> tokio::sync::oneshot::Receiver<CaptureSources> {
++        persisted: &PersistedCaptureSources,
++    ) -> Result<CaptureSources, Option<tokio::sync::oneshot::Receiver<CaptureSources>>> {
++        // Lock order: toplevels → pending_rescues (matches update_output_toplevels)
++        let toplevel_list = self.inner.toplevels.lock().unwrap();
++
++        if let Some(sources) = persisted.to_capture_sources_with(&toplevel_list, self) {
++            return Ok(sources);
++        }
++
++        let mut rescues = self.inner.pending_rescues.lock().unwrap();
++        rescues.retain(|r| !r.sender.is_closed());
++
++        if rescues.len() >= MAX_PENDING_RESCUES {
++            log::warn!("pending rescue limit ({MAX_PENDING_RESCUES}) reached");
++            return Err(None);
++        }
++
 +        let (tx, rx) = tokio::sync::oneshot::channel();
-+        self.inner
-+            .pending_rescues
-+            .lock()
-+            .unwrap()
-+            .push(PendingRescue {
-+                persisted,
-+                sender: tx,
-+            });
-+        rx
++        rescues.push(PendingRescue {
++            persisted: persisted.clone(),
++            sender: tx,
++        });
++        Err(Some(rx))
 +    }
 +
      pub fn output_info(&self, output: &wl_output::WlOutput) -> Option<OutputInfo> {
