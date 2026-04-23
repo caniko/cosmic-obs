@@ -11,8 +11,8 @@
 //!    a smoke test for the "real sleep inside `on_start`" case. Uses a 50ms
 //!    delay; the assertion is only that Start completes successfully, not
 //!    that it took exactly 50ms.
-//! 2. `skip_mode_surfaces_response_1_even_with_rescue_scenario` — policy
-//!    assertion: when the caller sets `restore_fail_mode=Skip`, the portal
+//! 2. `skip_action_surfaces_response_1_even_with_rescue_scenario` — policy
+//!    assertion: when the caller sets `restore_policy.default_action=Skip`, the portal
 //!    surfaces `response=1` immediately via `SelectSources` and never
 //!    reaches the scenario's rescue delay. This is the "permission store
 //!    empty" fallback path in gaps.md §3B.
@@ -23,19 +23,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use screencast_portal_mock::{DelayedRestore, RestoreFailReason};
-use zbus::zvariant::{OwnedValue, Value};
+use zbus::zvariant::OwnedValue;
 
 fn prompt_with_stale_token() -> HashMap<String, OwnedValue> {
-    let mut opts = HashMap::new();
-    opts.insert(
-        "restore_token".into(),
-        OwnedValue::try_from(Value::new("stale-token".to_string())).unwrap(),
-    );
-    opts.insert(
-        "restore_fail_mode".into(),
-        OwnedValue::try_from(Value::U32(0)).unwrap(),
-    );
-    opts
+    helpers::token_and_policy(Some(0), &[])
 }
 
 #[tokio::test]
@@ -61,7 +52,7 @@ async fn prompt_mode_rescue_smoke() {
 }
 
 #[tokio::test]
-async fn skip_mode_surfaces_response_1_even_with_rescue_scenario() {
+async fn skip_action_surfaces_response_1_even_with_rescue_scenario() {
     // Policy assertion: Skip mode must *not* wait for the rescue delay.
     // A 30-second delay is used to make any regression loud — the elapsed
     // bound of 5s is slack for bus warm-up, not a timing measurement.
@@ -75,8 +66,8 @@ async fn skip_mode_surfaces_response_1_even_with_rescue_scenario() {
 
     let mut opts = prompt_with_stale_token();
     opts.insert(
-        "restore_fail_mode".into(),
-        OwnedValue::try_from(Value::U32(1)).unwrap(),
+        "restore_policy".into(),
+        helpers::restore_policy_value(Some(1), &[]),
     );
 
     let t0 = Instant::now();

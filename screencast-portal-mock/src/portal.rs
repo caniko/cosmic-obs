@@ -1,11 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
-use crate::records::{Call, RestoreFailMode, SourceTypes};
+use crate::records::{
+    Call, RestoreAction, RestorePolicy, SourceTypes, parse_restore_policy, restore_failure_value,
+};
 use crate::scenario::Scenario;
 
 /// Errors from the portal server.
@@ -57,6 +59,7 @@ impl SessionObject {
 pub struct ScreenCastPortal {
     scenario: Arc<dyn Scenario>,
     calls: Arc<Mutex<Vec<Call>>>,
+    closed_sessions: Arc<Mutex<HashSet<String>>>,
     conn: zbus::Connection,
     counter: Arc<AtomicU64>,
 }
@@ -66,12 +69,14 @@ impl ScreenCastPortal {
     pub fn new(
         scenario: Arc<dyn Scenario>,
         calls: Arc<Mutex<Vec<Call>>>,
+        closed_sessions: Arc<Mutex<HashSet<String>>>,
         conn: zbus::Connection,
         counter: Arc<AtomicU64>,
     ) -> Self {
         Self {
             scenario,
             calls,
+            closed_sessions,
             conn,
             counter,
         }
@@ -167,10 +172,21 @@ impl ScreenCastPortal {
             .and_then(|v| v.downcast_ref::<zbus::zvariant::Str<'_>>().ok())
             .map(|s| s.to_string());
 
-        let restore_fail_mode = options
-            .get("restore_fail_mode")
-            .and_then(|v| <u32>::try_from(v).ok())
-            .and_then(|v| RestoreFailMode::try_from(v).ok());
+        let restore_policy = options
+            .get("restore_policy")
+            .map(parse_restore_policy)
+            .transpose()
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
+        let had_restore_token = restore_token.is_some();
+
+        if self
+            .closed_sessions
+            .lock()
+            .expect("closed_sessions mutex poisoned")
+            .contains(session_handle.as_str())
+        {
+            return Err(zbus::fdo::Error::Failed("session is closed".into()));
+        }
 
         let call = Call {
             timestamp: std::time::Instant::now(),
@@ -181,7 +197,7 @@ impl ScreenCastPortal {
             persist_mode,
             restore_token,
             source_label,
-            restore_fail_mode,
+            restore_policy: restore_policy.clone(),
             raw_options: options.clone(),
         };
 
@@ -190,7 +206,9 @@ impl ScreenCastPortal {
         let conn = self.conn.clone();
         let scenario = self.scenario.clone();
         let rp = request_path.clone();
-        let policy = restore_fail_mode.unwrap_or(RestoreFailMode::Prompt);
+        let sp = session_handle.clone();
+        let closed_sessions = self.closed_sessions.clone();
+        let policy = restore_policy.unwrap_or_else(RestorePolicy::default);
 
         conn.object_server()
             .at(&request_path, RequestObject)
@@ -203,23 +221,38 @@ impl ScreenCastPortal {
                 Ok(extra) => {
                     fire_response(&conn, &rp, 0, extra).await;
                 }
-                Err(_failure) => match policy {
-                    RestoreFailMode::Prompt => {
-                        fire_response(&conn, &rp, 0, HashMap::new()).await;
+                Err(failure) => {
+                    let action = if had_restore_token {
+                        policy.action_for(failure.reason)
+                    } else {
+                        RestoreAction::Prompt
+                    };
+                    match action {
+                        RestoreAction::Prompt => {
+                            fire_response(&conn, &rp, 0, HashMap::new()).await;
+                        }
+                        RestoreAction::Skip => {
+                            let mut results = HashMap::new();
+                            results.insert(
+                                "restore_failure".into(),
+                                restore_failure_value(failure.reason, action),
+                            );
+                            fire_response(&conn, &rp, 1, results).await;
+                            mark_session_closed(&closed_sessions, &sp);
+                            fire_session_closed(&conn, &sp).await;
+                        }
+                        RestoreAction::Error => {
+                            let mut results = HashMap::new();
+                            results.insert(
+                                "restore_failure".into(),
+                                restore_failure_value(failure.reason, action),
+                            );
+                            fire_response(&conn, &rp, 2, results).await;
+                            mark_session_closed(&closed_sessions, &sp);
+                            fire_session_closed(&conn, &sp).await;
+                        }
                     }
-                    RestoreFailMode::Skip => {
-                        fire_response(&conn, &rp, 1, HashMap::new()).await;
-                    }
-                    RestoreFailMode::Error => {
-                        let mut results = HashMap::new();
-                        results.insert(
-                            "restore_failed".into(),
-                            OwnedValue::try_from(Value::Bool(true))
-                                .expect("bool-to-OwnedValue is infallible"),
-                        );
-                        fire_response(&conn, &rp, 2, results).await;
-                    }
-                },
+                }
             }
         });
 
@@ -228,10 +261,19 @@ impl ScreenCastPortal {
 
     async fn start(
         &self,
-        _session_handle: OwnedObjectPath,
+        session_handle: OwnedObjectPath,
         _parent_window: String,
         options: HashMap<String, OwnedValue>,
     ) -> zbus::fdo::Result<OwnedObjectPath> {
+        if self
+            .closed_sessions
+            .lock()
+            .expect("closed_sessions mutex poisoned")
+            .contains(session_handle.as_str())
+        {
+            return Err(zbus::fdo::Error::Failed("session is closed".into()));
+        }
+
         let id = self.next_id();
         let request_path =
             OwnedObjectPath::try_from(format!("/org/freedesktop/portal/desktop/request/{id}"))
@@ -294,6 +336,29 @@ async fn fire_response(
     }
 }
 
+fn mark_session_closed(
+    closed_sessions: &Arc<Mutex<HashSet<String>>>,
+    session_path: &OwnedObjectPath,
+) {
+    closed_sessions
+        .lock()
+        .expect("closed_sessions mutex poisoned")
+        .insert(session_path.as_str().to_owned());
+}
+
+/// Fire the `Closed` signal on a session object path.
+async fn fire_session_closed(conn: &zbus::Connection, session_path: &OwnedObjectPath) {
+    let iface_ref = conn
+        .object_server()
+        .interface::<_, SessionObject>(session_path.as_ref())
+        .await;
+
+    if let Ok(iface_ref) = iface_ref {
+        let emitter = iface_ref.signal_emitter();
+        let _ = SessionObject::closed(emitter).await;
+    }
+}
+
 /// A handle to the running mock portal server.
 pub struct MockPortal;
 
@@ -318,12 +383,14 @@ impl MockPortal {
         })?;
 
         let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
+        let closed_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let counter = Arc::new(AtomicU64::new(0));
         let scenario: Arc<dyn Scenario> = Arc::new(scenario);
 
         let portal = ScreenCastPortal::new(
             scenario.clone(),
             calls.clone(),
+            closed_sessions,
             conn.clone(),
             counter.clone(),
         );

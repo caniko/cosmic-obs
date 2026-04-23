@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::records::{Call, RestoreFailMode};
+use crate::records::{Call, RestoreAction, RestoreFailReason};
 
 /// Errors from waiting on mock portal state.
 #[derive(Debug, thiserror::Error)]
@@ -86,33 +86,67 @@ impl MockPortalHandle {
         );
     }
 
-    /// Assert that call at `index` has the given `restore_fail_mode`.
+    /// Assert that call at `index` has the given default restore action.
     ///
     /// # Panics
-    /// Panics if the policy does not match.
-    pub fn assert_restore_fail_mode(&self, index: usize, expected: RestoreFailMode) {
+    /// Panics if the policy is absent or the default action does not match.
+    pub fn assert_restore_default_action(&self, index: usize, expected: RestoreAction) {
         let calls = self.calls.lock().expect("calls mutex poisoned");
         let call = &calls[index];
         assert_eq!(
-            call.restore_fail_mode,
+            call.restore_policy
+                .as_ref()
+                .and_then(|policy| policy.default_action),
             Some(expected),
-            "call[{index}] restore_fail_mode mismatch"
+            "call[{index}] restore_policy.default_action mismatch"
         );
     }
 
-    /// Assert that no recorded calls triggered a user prompt
-    /// (i.e. none have `restore_fail_mode == Some(Prompt)` with a restore failure).
+    /// Assert that call at `index` has the given reason-specific restore action.
     ///
-    /// This is a lightweight check: it verifies that no call explicitly set
-    /// the policy to `Prompt`. For full prompt detection you would need the
-    /// scenario's output, which is not tracked here.
+    /// # Panics
+    /// Panics if the policy or reason-specific action is absent.
+    pub fn assert_restore_reason_action(
+        &self,
+        index: usize,
+        reason: RestoreFailReason,
+        expected: RestoreAction,
+    ) {
+        let calls = self.calls.lock().expect("calls mutex poisoned");
+        let call = &calls[index];
+        assert_eq!(
+            call.restore_policy
+                .as_ref()
+                .and_then(|policy| policy.actions.get(&reason).copied()),
+            Some(expected),
+            "call[{index}] restore_policy.actions[{reason:?}] mismatch"
+        );
+    }
+
+    /// Assert that call at `index` has no `restore_policy`.
+    ///
+    /// # Panics
+    /// Panics if a policy is present.
+    pub fn assert_no_restore_policy(&self, index: usize) {
+        let calls = self.calls.lock().expect("calls mutex poisoned");
+        let call = &calls[index];
+        assert!(
+            call.restore_policy.is_none(),
+            "call[{index}] expected no restore_policy, got {:?}",
+            call.restore_policy
+        );
+    }
+
+    /// Assert that no recorded calls explicitly requested prompt as the default action.
     pub fn assert_no_prompts(&self) {
         let calls = self.calls.lock().expect("calls mutex poisoned");
         for (i, call) in calls.iter().enumerate() {
             assert_ne!(
-                call.restore_fail_mode,
-                Some(RestoreFailMode::Prompt),
-                "call[{i}] had restore_fail_mode=Prompt"
+                call.restore_policy
+                    .as_ref()
+                    .and_then(|policy| policy.default_action),
+                Some(RestoreAction::Prompt),
+                "call[{i}] had restore_policy.default_action=Prompt"
             );
         }
     }

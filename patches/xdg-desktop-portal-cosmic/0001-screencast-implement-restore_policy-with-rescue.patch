@@ -7,12 +7,13 @@ Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 When a restore token resolves to restore_data but the target window is
-not yet running, the backend now checks restore_fail_mode:
+not yet running, the backend now checks restore_policy for the
+source_unavailable reason:
 
-  policy 0 (prompt): show picker dialog as before
-  policy 1 (skip):   register rescue hook — wait up to 30s for
+  action 0 (prompt): show picker dialog as before
+  action 1 (skip):   register rescue hook — wait up to 30s for
                       the window to appear; if session closed, cancel
-  policy 2 (error):  same as skip, but return restore_failed=true on
+  action 2 (error):  same as skip, but return restore_failure on
                       session close
 
 The rescue mechanism uses a zero-cost hook system: PendingRescue structs
@@ -33,7 +34,7 @@ XWayland windows without WM_CLASS.
 Restore data bumped from version 1 to 2 to store app_ids, titles, and
 rescue_modes. V1 data deserializes with padded vecs (exact-only matching).
 
-Also adds source_label and restore_fail_mode to SelectSourcesOptions,
+Also adds source_label and restore_policy to SelectSourcesOptions,
 and bumps the backend interface version from 4 to 6.
 
 Improvements over initial RFC draft:
@@ -330,20 +331,27 @@ index b31f604..8d589d7 100644
      }
  }
  
-@@ -122,6 +257,8 @@ struct SelectSourcesOptions {
+@@ -122,6 +257,15 @@ struct SelectSourcesOptions {
      restore_data: Option<RestoreData>,
      // Default: 0
      persist_mode: Option<u32>,
 +    source_label: Option<String>,
-+    restore_fail_mode: Option<u32>,
++    restore_policy: Option<HashMap<String, zvariant::OwnedValue>>,
  }
  
++#[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
++struct RestoreFailureResult {
++    reason: String,
++    action: u32,
++    token_invalid: bool,
++}
++
  #[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
 @@ -140,6 +277,7 @@ struct StartResult {
      streams: Vec<(u32, StreamProps)>,
      persist_mode: Option<u32>,
      restore_data: Option<RestoreData>,
-+    restore_failed: Option<bool>,
++    restore_failure: Option<RestoreFailureResult>,
  }
  
  #[derive(Default)]
@@ -352,11 +360,11 @@ index b31f604..8d589d7 100644
      source_types: BitFlags<SourceType>,
      persisted_capture_sources: Option<PersistedCaptureSources>,
 +    source_label: Option<String>,
-+    restore_fail_mode: u32,
++    source_unavailable_action: u32,
      closed: bool,
  }
  
-@@ -161,6 +301,33 @@ impl SessionData {
+@@ -161,6 +301,63 @@ impl SessionData {
      }
  }
  
@@ -387,18 +395,46 @@ index b31f604..8d589d7 100644
 +    )
 +}
 +
++fn restore_policy_action(
++    policy: &Option<HashMap<String, zvariant::OwnedValue>>,
++    reason: &str,
++) -> u32 {
++    let Some(policy) = policy else {
++        return 0;
++    };
++
++    let default_action = policy
++        .get("default_action")
++        .and_then(|v| u32::try_from(v).ok())
++        .filter(|v| *v <= 2)
++        .unwrap_or(0);
++
++    policy
++        .get("actions")
++        .and_then(|v| v.clone().try_into().ok())
++        .and_then(|actions: HashMap<String, u32>| actions.get(reason).copied())
++        .filter(|v| *v <= 2)
++        .unwrap_or(default_action)
++}
++
++fn restore_failure_result(reason: &str, action: u32) -> RestoreFailureResult {
++    RestoreFailureResult {
++        reason: reason.to_string(),
++        action,
++        token_invalid: reason != "source_unavailable",
++    }
++}
++
  pub struct ScreenCast {
      wayland_helper: WaylandHelper,
      tx: Sender<subscription::Event>,
-@@ -223,6 +390,11 @@ impl ScreenCast {
+@@ -223,6 +390,9 @@ impl ScreenCast {
                          log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
                      }
                  }
 +                session_data.source_label = sanitize_label(options.source_label);
-+                session_data.restore_fail_mode = options
-+                    .restore_fail_mode
-+                    .filter(|v| *v <= 2)
-+                    .unwrap_or(0);
++                session_data.source_unavailable_action =
++                    restore_policy_action(&options.restore_policy, "source_unavailable");
                  PortalResponse::Success(HashMap::new())
              }
              None => PortalResponse::Other,
@@ -413,7 +449,7 @@ index b31f604..8d589d7 100644
 +                source_types,
 +                persisted_capture_sources,
 +                source_label,
-+                restore_fail_mode,
++                source_unavailable_action,
 +            ) = {
                  let session_data = interface.get_mut().await;
                  let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_HIDDEN);
@@ -421,18 +457,18 @@ index b31f604..8d589d7 100644
                  let source_types = session_data.source_types;
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
 +                let source_label = session_data.source_label.clone();
-+                let restore_fail_mode = session_data.restore_fail_mode;
++                let source_unavailable_action = session_data.source_unavailable_action;
                  (
                      cursor_mode,
                      multiple,
                      source_types,
                      persisted_capture_sources,
 +                    source_label,
-+                    restore_fail_mode,
++                    source_unavailable_action,
                  )
              };
  
-@@ -268,11 +451,74 @@ impl ScreenCast {
+@@ -268,11 +451,77 @@ impl ScreenCast {
              }
  
              let capture_sources = if let Some(capture_sources) =
@@ -444,11 +480,11 @@ index b31f604..8d589d7 100644
 +                // Immediate restore succeeded
                  capture_sources
 +            } else if let Some(persisted) = &persisted_capture_sources {
-+                match restore_fail_mode {
++                match source_unavailable_action {
 +                    1 | 2 => {
 +                        log::info!(
-+                            "restore failed, policy={}, registering rescue (source_label={:?})",
-+                            restore_fail_mode,
++                            "restore source unavailable, action={}, registering rescue (source_label={:?})",
++                            source_unavailable_action,
 +                            source_label,
 +                        );
 +                        match self.wayland_helper.check_or_rescue(persisted) {
@@ -469,17 +505,20 @@ index b31f604..8d589d7 100644
 +                                    sources
 +                                } else {
 +                                    log::info!(
-+                                        "rescue cancelled/failed, applying restore_fail_mode={}",
-+                                        restore_fail_mode,
++                                        "rescue cancelled/failed, applying restore action={}",
++                                        source_unavailable_action,
 +                                    );
-+                                    if restore_fail_mode == 1 {
++                                    if source_unavailable_action == 1 {
 +                                        return PortalResponse::Cancelled;
 +                                    } else {
 +                                        return PortalResponse::OtherWithResults(StartResult {
 +                                            streams: vec![],
 +                                            persist_mode: None,
 +                                            restore_data: None,
-+                                            restore_failed: Some(true),
++                                            restore_failure: Some(restore_failure_result(
++                                                "source_unavailable",
++                                                source_unavailable_action,
++                                            )),
 +                                        });
 +                                    }
 +                                }
@@ -487,7 +526,7 @@ index b31f604..8d589d7 100644
 +                        }
 +                    }
 +                    _ => {
-+                        // policy 0 (prompt): show picker dialog
++                        // action 0 (prompt): show picker dialog
 +                        let resp = screencast_dialog::show_screencast_prompt(
 +                            &self.tx,
 +                            &session_handle,
@@ -533,7 +572,7 @@ index b31f604..8d589d7 100644
                  streams,
                  persist_mode: None,
                  restore_data: persisted_capture_sources.map(|x| x.into()),
-+                restore_failed: None,
++                restore_failure: None,
              })
          })
          .await
@@ -866,4 +905,3 @@ index 15a9536..02f3509 100644
      }
 -- 
 2.53.0
-

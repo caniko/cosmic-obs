@@ -1,0 +1,435 @@
+From 3a8f303d238cb752227a5351a3ab842234062bcb Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 23 Apr 2026 10:46:51 +0200
+Subject: [PATCH] remote: add source_label and restore_policy to screencast API
+
+---
+ libportal/remote.c | 289 +++++++++++++++++++++++++++++++++++++++++++--
+ libportal/remote.h |  55 +++++++++
+ 2 files changed, 332 insertions(+), 12 deletions(-)
+
+diff --git a/libportal/remote.c b/libportal/remote.c
+index a0da823..960dfb2 100644
+--- a/libportal/remote.c
++++ b/libportal/remote.c
+@@ -34,6 +34,8 @@ typedef struct {
+   XdpCursorMode cursor_mode;
+   XdpPersistMode persist_mode;
+   char *restore_token;
++  char *source_label;
++  XdpRestorePolicy *restore_policy;
+   gboolean multiple;
+   guint signal_id;
+   GTask *task;
+@@ -51,6 +53,8 @@ create_call_free (CreateCall *call)
+ 
+   g_free (call->request_path);
+   g_free (call->restore_token);
++  g_free (call->source_label);
++  g_clear_pointer (&call->restore_policy, xdp_restore_policy_free);
+ 
+   g_object_unref (call->portal);
+   g_object_unref (call->task);
+@@ -60,6 +64,104 @@ create_call_free (CreateCall *call)
+   g_free (call);
+ }
+ 
++struct _XdpRestorePolicy {
++  gboolean has_default_action;
++  XdpRestoreAction default_action;
++  GHashTable *actions;
++};
++
++static const char *
++restore_failure_reason_to_string (XdpRestoreFailureReason reason)
++{
++  switch (reason)
++    {
++    case XDP_RESTORE_FAILURE_TOKEN_NOT_FOUND:
++      return "token_not_found";
++    case XDP_RESTORE_FAILURE_SOURCE_UNAVAILABLE:
++      return "source_unavailable";
++    case XDP_RESTORE_FAILURE_PERMISSION_REVOKED:
++      return "permission_revoked";
++    case XDP_RESTORE_FAILURE_TOKEN_CONSUMED:
++      return "token_consumed";
++    default:
++      g_return_val_if_reached ("token_not_found");
++    }
++}
++
++static XdpRestoreAction
++normalize_restore_action (XdpRestoreAction action)
++{
++  if (action > XDP_RESTORE_ACTION_ERROR)
++    return XDP_RESTORE_ACTION_PROMPT;
++
++  return action;
++}
++
++XdpRestorePolicy *
++xdp_restore_policy_new (void)
++{
++  XdpRestorePolicy *policy = g_new0 (XdpRestorePolicy, 1);
++
++  policy->actions = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
++
++  return policy;
++}
++
++XdpRestorePolicy *
++xdp_restore_policy_copy (const XdpRestorePolicy *policy)
++{
++  XdpRestorePolicy *copy;
++  GHashTableIter iter;
++  gpointer key, value;
++
++  if (!policy)
++    return NULL;
++
++  copy = xdp_restore_policy_new ();
++  copy->has_default_action = policy->has_default_action;
++  copy->default_action = policy->default_action;
++
++  g_hash_table_iter_init (&iter, policy->actions);
++  while (g_hash_table_iter_next (&iter, &key, &value))
++    g_hash_table_insert (copy->actions,
++                         g_strdup ((const char *) key),
++                         value);
++
++  return copy;
++}
++
++void
++xdp_restore_policy_free (XdpRestorePolicy *policy)
++{
++  if (!policy)
++    return;
++
++  g_clear_pointer (&policy->actions, g_hash_table_unref);
++  g_free (policy);
++}
++
++void
++xdp_restore_policy_set_default_action (XdpRestorePolicy *policy,
++                                       XdpRestoreAction action)
++{
++  g_return_if_fail (policy != NULL);
++
++  policy->has_default_action = TRUE;
++  policy->default_action = normalize_restore_action (action);
++}
++
++void
++xdp_restore_policy_set_action (XdpRestorePolicy *policy,
++                               XdpRestoreFailureReason reason,
++                               XdpRestoreAction action)
++{
++  g_return_if_fail (policy != NULL);
++
++  g_hash_table_insert (policy->actions,
++                       g_strdup (restore_failure_reason_to_string (reason)),
++                       GUINT_TO_POINTER (normalize_restore_action (action)));
++}
++
+ static void
+ sources_selected (GDBusConnection *bus,
+                   const char *sender_name,
+@@ -84,10 +186,39 @@ sources_selected (GDBusConnection *bus,
+       session = _xdp_session_new (call->portal, call->id, call->type);
+       g_task_return_pointer (call->task, session, g_object_unref);
+     }
+-  else if (response == 1)
+-    g_task_return_new_error (call->task, G_IO_ERROR, G_IO_ERROR_CANCELLED, "Screencast SelectSources() canceled");
+-  else if (response == 2)
+-    g_task_return_new_error (call->task, G_IO_ERROR, G_IO_ERROR_FAILED, "Screencast SelectSources() failed");
++  else if (response == 1 || response == 2)
++    {
++      g_autoptr(GVariant) restore_failure = NULL;
++
++      restore_failure = g_variant_lookup_value (ret,
++                                                "restore_failure",
++                                                G_VARIANT_TYPE_VARDICT);
++      if (restore_failure)
++        {
++          const char *reason = "unknown";
++          guint32 action = response;
++          gboolean token_invalid = FALSE;
++
++          g_variant_lookup (restore_failure, "reason", "&s", &reason);
++          g_variant_lookup (restore_failure, "action", "u", &action);
++          g_variant_lookup (restore_failure, "token_invalid", "b", &token_invalid);
++          g_task_return_new_error (call->task,
++                                   G_IO_ERROR,
++                                   response == 1 ? G_IO_ERROR_CANCELLED : G_IO_ERROR_FAILED,
++                                   "Screencast SelectSources() restore failure: reason=%s action=%u token_invalid=%s",
++                                   reason,
++                                   action,
++                                   token_invalid ? "true" : "false");
++        }
++      else
++        {
++          g_task_return_new_error (call->task,
++                                   G_IO_ERROR,
++                                   response == 1 ? G_IO_ERROR_CANCELLED : G_IO_ERROR_FAILED,
++                                   response == 1 ? "Screencast SelectSources() canceled" :
++                                                   "Screencast SelectSources() failed");
++        }
++    }
+ 
+   create_call_free (call);
+ }
+@@ -141,6 +272,44 @@ select_sources (CreateCall *call)
+       if (call->restore_token)
+         g_variant_builder_add (&options, "{sv}", "restore_token", g_variant_new_string (call->restore_token));
+     }
++  if (call->portal->screencast_interface_version >= 6)
++    {
++      if (call->source_label && *call->source_label)
++        g_variant_builder_add (&options, "{sv}", "source_label", g_variant_new_string (call->source_label));
++
++      if (call->restore_token && call->restore_policy)
++        {
++          GVariantBuilder policy;
++          GHashTableIter iter;
++          gpointer key, value;
++
++          g_variant_builder_init (&policy, G_VARIANT_TYPE_VARDICT);
++          if (call->restore_policy->has_default_action)
++            g_variant_builder_add (&policy, "{sv}",
++                                   "default_action",
++                                   g_variant_new_uint32 (call->restore_policy->default_action));
++
++          if (g_hash_table_size (call->restore_policy->actions) > 0)
++            {
++              GVariantBuilder actions;
++
++              g_variant_builder_init (&actions, G_VARIANT_TYPE ("a{su}"));
++              g_hash_table_iter_init (&iter, call->restore_policy->actions);
++              while (g_hash_table_iter_next (&iter, &key, &value))
++                g_variant_builder_add (&actions, "{su}",
++                                       (const char *) key,
++                                       GPOINTER_TO_UINT (value));
++
++              g_variant_builder_add (&policy, "{sv}",
++                                     "actions",
++                                     g_variant_builder_end (&actions));
++            }
++
++          g_variant_builder_add (&options, "{sv}",
++                                 "restore_policy",
++                                 g_variant_builder_end (&policy));
++        }
++    }
+   g_dbus_connection_call (call->portal->bus,
+                           PORTAL_BUS_NAME,
+                           PORTAL_OBJECT_PATH,
+@@ -453,6 +622,55 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
+                                       GCancellable *cancellable,
+                                       GAsyncReadyCallback  callback,
+                                       gpointer data)
++{
++  xdp_portal_create_screencast_session_full (portal,
++                                             outputs,
++                                             flags,
++                                             cursor_mode,
++                                             persist_mode,
++                                             restore_token,
++                                             NULL,
++                                             NULL,
++                                             cancellable,
++                                             callback,
++                                             data);
++}
++
++/**
++ * xdp_portal_create_screencast_session_full: (finish-func xdp_portal_create_screencast_session_finish)
++ * @portal: a [class@Portal]
++ * @outputs: which kinds of source to offer in the dialog
++ * @flags: options for this call
++ * @cursor_mode: the cursor mode of the session
++ * @persist_mode: the persist mode of the session
++ * @restore_token: (nullable): the token of a previous screencast session to restore
++ * @source_label: (nullable): a human-readable label for the source
++ * @restore_policy: (nullable): policy when a restore token cannot be honoured
++ * @cancellable: (nullable): optional [class@Gio.Cancellable]
++ * @callback: (scope async): a callback to call when the request is done
++ * @data: data to pass to @callback
++ *
++ * Creates a session for a screencast.
++ *
++ * This is the same as [method@Portal.create_screencast_session], but
++ * additionally allows specifying @source_label and @restore_policy.
++ * These options require portal interface version 6 or later.
++ *
++ * When the request is done, @callback will be called. You can then
++ * call [method@Portal.create_screencast_session_finish] to get the results.
++ */
++void
++xdp_portal_create_screencast_session_full (XdpPortal *portal,
++                                           XdpOutputType outputs,
++                                           XdpScreencastFlags flags,
++                                           XdpCursorMode cursor_mode,
++                                           XdpPersistMode persist_mode,
++                                           const char *restore_token,
++                                           const char *source_label,
++                                           const XdpRestorePolicy *restore_policy,
++                                           GCancellable *cancellable,
++                                           GAsyncReadyCallback  callback,
++                                           gpointer data)
+ {
+   CreateCall *call;
+ 
+@@ -467,6 +685,27 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
+   call->cursor_mode = cursor_mode;
+   call->persist_mode = persist_mode;
+   call->restore_token = g_strdup (restore_token);
++  if (source_label != NULL && *source_label != '\0')
++    {
++      gsize len = strlen (source_label);
++
++      if (len > 256)
++        {
++          const char *end = source_label + 256;
++          const char *safe = g_utf8_find_prev_char (source_label, end);
++
++          if (safe != NULL && safe >= source_label)
++            call->source_label = g_strndup (source_label, safe - source_label);
++          else
++            call->source_label = g_strndup (source_label, 256);
++        }
++      else
++        {
++          call->source_label = g_strdup (source_label);
++        }
++    }
++
++  call->restore_policy = xdp_restore_policy_copy (restore_policy);
+   call->multiple = (flags & XDP_SCREENCAST_FLAG_MULTIPLE) != 0;
+   call->task = g_task_new (portal, cancellable, callback, data);
+ 
+@@ -680,14 +919,40 @@ session_started (GDBusConnection *bus,
+ 
+       g_task_return_boolean (call->task, TRUE);
+     }
+-  else if (response == 1)
+-    g_task_return_new_error (call->task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+-                             call->session->type == XDP_SESSION_REMOTE_DESKTOP ?
+-                             "Remote desktop canceled" : "Screencast canceled");
+-  else if (response == 2)
+-    g_task_return_new_error (call->task, G_IO_ERROR, G_IO_ERROR_FAILED,
+-                             call->session->type == XDP_SESSION_REMOTE_DESKTOP ?
+-                             "Remote desktop failed" : "Screencast failed");
++  else if (response == 1 || response == 2)
++    {
++      g_autoptr(GVariant) restore_failure = NULL;
++
++      restore_failure = g_variant_lookup_value (ret,
++                                                "restore_failure",
++                                                G_VARIANT_TYPE_VARDICT);
++      if (restore_failure)
++        {
++          const char *reason = "unknown";
++          guint32 action = response;
++          gboolean token_invalid = FALSE;
++
++          g_variant_lookup (restore_failure, "reason", "&s", &reason);
++          g_variant_lookup (restore_failure, "action", "u", &action);
++          g_variant_lookup (restore_failure, "token_invalid", "b", &token_invalid);
++          g_task_return_new_error (call->task,
++                                   G_IO_ERROR,
++                                   response == 1 ? G_IO_ERROR_CANCELLED : G_IO_ERROR_FAILED,
++                                   "Screencast restore failure: reason=%s action=%u token_invalid=%s",
++                                   reason,
++                                   action,
++                                   token_invalid ? "true" : "false");
++        }
++      else
++        {
++          g_task_return_new_error (call->task,
++                                   G_IO_ERROR,
++                                   response == 1 ? G_IO_ERROR_CANCELLED : G_IO_ERROR_FAILED,
++                                   call->session->type == XDP_SESSION_REMOTE_DESKTOP ?
++                                   (response == 1 ? "Remote desktop canceled" : "Remote desktop failed") :
++                                   (response == 1 ? "Screencast canceled" : "Screencast failed"));
++        }
++    }
+ 
+   start_call_free (call);
+ }
+diff --git a/libportal/remote.h b/libportal/remote.h
+index e5e75cb..2123ccf 100644
+--- a/libportal/remote.h
++++ b/libportal/remote.h
+@@ -110,6 +110,48 @@ typedef enum {
+   XDP_PERSIST_MODE_PERSISTENT,
+ } XdpPersistMode;
+ 
++/**
++ * XdpRestoreAction:
++ * @XDP_RESTORE_ACTION_PROMPT: Show the source picker (default).
++ * @XDP_RESTORE_ACTION_SKIP: Return cancelled without prompting.
++ * @XDP_RESTORE_ACTION_ERROR: Return error with restore_failure details.
++ *
++ * Determines what happens when a restore token cannot be honoured.
++ * Requires portal interface version 6 or later.
++ */
++typedef enum {
++  XDP_RESTORE_ACTION_PROMPT = 0,
++  XDP_RESTORE_ACTION_SKIP   = 1,
++  XDP_RESTORE_ACTION_ERROR  = 2,
++} XdpRestoreAction;
++
++typedef enum {
++  XDP_RESTORE_FAILURE_TOKEN_NOT_FOUND,
++  XDP_RESTORE_FAILURE_SOURCE_UNAVAILABLE,
++  XDP_RESTORE_FAILURE_PERMISSION_REVOKED,
++  XDP_RESTORE_FAILURE_TOKEN_CONSUMED,
++} XdpRestoreFailureReason;
++
++typedef struct _XdpRestorePolicy XdpRestorePolicy;
++
++XDP_PUBLIC
++XdpRestorePolicy *xdp_restore_policy_new                (void);
++
++XDP_PUBLIC
++XdpRestorePolicy *xdp_restore_policy_copy               (const XdpRestorePolicy    *policy);
++
++XDP_PUBLIC
++void              xdp_restore_policy_free               (XdpRestorePolicy          *policy);
++
++XDP_PUBLIC
++void              xdp_restore_policy_set_default_action (XdpRestorePolicy          *policy,
++                                                         XdpRestoreAction           action);
++
++XDP_PUBLIC
++void              xdp_restore_policy_set_action         (XdpRestorePolicy          *policy,
++                                                         XdpRestoreFailureReason    reason,
++                                                         XdpRestoreAction           action);
++
+ XDP_PUBLIC
+ void        xdp_portal_create_screencast_session            (XdpPortal            *portal,
+                                                              XdpOutputType         outputs,
+@@ -121,6 +163,19 @@ void        xdp_portal_create_screencast_session            (XdpPortal
+                                                              GAsyncReadyCallback   callback,
+                                                              gpointer              data);
+ 
++XDP_PUBLIC
++void        xdp_portal_create_screencast_session_full       (XdpPortal              *portal,
++                                                             XdpOutputType           outputs,
++                                                             XdpScreencastFlags      flags,
++                                                             XdpCursorMode           cursor_mode,
++                                                             XdpPersistMode          persist_mode,
++                                                             const char             *restore_token,
++                                                             const char             *source_label,
++                                                             const XdpRestorePolicy *restore_policy,
++                                                             GCancellable           *cancellable,
++                                                             GAsyncReadyCallback     callback,
++                                                             gpointer                data);
++
+ XDP_PUBLIC
+ XdpSession *xdp_portal_create_screencast_session_finish     (XdpPortal            *portal,
+                                                              GAsyncResult         *result,
+-- 
+2.53.0
+

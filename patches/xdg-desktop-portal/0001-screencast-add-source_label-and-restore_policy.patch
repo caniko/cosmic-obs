@@ -1,0 +1,534 @@
+From adcf0a6e14709594e00d07d2159e9cee4c27e247 Mon Sep 17 00:00:00 2001
+From: agent <agent@local>
+Date: Thu, 23 Apr 2026 10:46:51 +0200
+Subject: [PATCH] screencast: add source_label and restore_policy to
+ SelectSources
+
+---
+ data/org.freedesktop.portal.ScreenCast.xml |  80 ++++++++-
+ src/remote-desktop.c                       |   4 +-
+ src/screen-cast.c                          | 192 ++++++++++++++++++++-
+ src/xdp-session-persistence.c              |  69 +++++++-
+ src/xdp-session-persistence.h              |  11 +-
+ 5 files changed, 338 insertions(+), 18 deletions(-)
+
+diff --git a/data/org.freedesktop.portal.ScreenCast.xml b/data/org.freedesktop.portal.ScreenCast.xml
+index 8233242..c98e92b 100644
+--- a/data/org.freedesktop.portal.ScreenCast.xml
++++ b/data/org.freedesktop.portal.ScreenCast.xml
+@@ -25,7 +25,7 @@
+ 
+       The Screen cast portal allows to create screen cast sessions.
+ 
+-      This documentation describes version 5 of this interface.
++      This documentation describes version 6 of this interface.
+   -->
+   <interface name="org.freedesktop.portal.ScreenCast">
+     <!--
+@@ -145,6 +145,84 @@
+ 
+           This option was added in version 4 of this interface.
+ 
++        * ``source_label`` (``s``)
++
++          A human-readable label for this source request. An optional hint
++          provided by the application to identify the purpose or origin of
++          this SelectSources call. If supported by the portal backend, this
++          string should be surfaced in the source picker dialog. Backends
++          that do not support this key must ignore it. Backends SHOULD treat
++          an empty string the same as an absent key.
++
++          This string is plain text. Backends MUST NOT interpret it as Pango
++          markup, HTML, or any other rich text format. Backends SHOULD
++          truncate labels exceeding 256 bytes for display. Backends SHOULD
++          strip Unicode control characters (U+0000-U+001F, U+007F,
++          U+200E-U+200F, U+202A-U+202E, U+2066-U+2069) before display.
++          The label is untrusted application-provided input with the same
++          trust model as window titles.
++
++          This option was added in version 6 of this interface.
++
++        * ``restore_policy`` (``a{sv}``)
++
++          Determines what the portal does when a restore_token is provided
++          but the session cannot be restored. Supported fields:
++
++          - ``default_action`` (``u``): optional action used when no
++            recognized reason-specific action applies. Defaults to prompt.
++          - ``actions`` (``a{su}``): optional map from reason string to
++            action. Unknown reason strings are ignored.
++
++          Action values are:
++
++          - ``0`` - prompt (default): show the source picker as if no token was
++            provided. This preserves current behaviour.
++          - ``1`` - skip: do not show the picker; return response=1 with
++            restore_failure in the results vardict.
++          - ``2`` - error: do not show the picker; return response=2 with
++            restore_failure in the results vardict.
++
++          Standard reason strings are ``token_not_found``,
++          ``permission_revoked``, ``token_consumed``, and
++          ``source_unavailable``. Unknown action values are treated as
++          absent and fall back to default_action, then prompt.
++
++          Has no effect if no restore_token is provided. Has no effect on
++          RemoteDesktop sessions, where restore_token is not supported.
++
++          The skip and error actions do not bypass user consent. They only
++          activate when a previously-consented restore_token cannot be
++          honoured. No new source access is granted without user interaction.
++
++          This option was added in version 6 of this interface.
++
++      The following results get returned via the
++      org.freedesktop.portal.Request::Response signal for policy-driven
++      skip/error outcomes:
++
++        * ``restore_failure`` (``a{sv}``)
++
++          Present when response is 1 or 2 and the failure was caused by an
++          inability to honour a provided restore_token. Fields:
++
++          - ``reason`` (``s``): standardized reason string.
++          - ``action`` (``u``): action that produced the response.
++          - ``token_invalid`` (``b``): true when applications SHOULD discard
++            the token; false for temporarily unavailable restored sources.
++
++          This result was added in version 6 of this interface.
++
++      When restore_policy resolves to skip or error and the restore_token
++      cannot be honoured, the SelectSources method itself completes
++      normally. The failure is communicated via the Request::Response
++      signal and the session is closed by the portal. Callers MUST
++      subscribe to the Request::Response signal before calling
++      SelectSources to observe these outcomes.
++
++      Portal implementations MUST ignore restore_policy when no
++      restore_token is present in the same SelectSources call.
++
+         For available source types, see the AvailableSourceTypes property.
+     -->
+     <method name="SelectSources">
+diff --git a/src/remote-desktop.c b/src/remote-desktop.c
+index 5cfbd87..7ef9e68 100644
+--- a/src/remote-desktop.c
++++ b/src/remote-desktop.c
+@@ -485,7 +485,8 @@ replace_remote_desktop_restore_token_with_data (XdpSession *session,
+   xdp_session_persistence_replace_restore_token_with_data (session,
+                                                            REMOTE_DESKTOP_TABLE,
+                                                            in_out_options,
+-                                                           &remote_desktop_session->restore_token);
++                                                           &remote_desktop_session->restore_token,
++                                                           NULL);
+ 
+   return TRUE;
+ }
+@@ -1675,4 +1676,3 @@ remote_desktop_session_class_init (RemoteDesktopSessionClass *klass)
+   quark_request_session =
+     g_quark_from_static_string ("-xdp-request-remote-desktop-session");
+ }
+-
+diff --git a/src/screen-cast.c b/src/screen-cast.c
+index 562d53a..90ec507 100644
+--- a/src/screen-cast.c
++++ b/src/screen-cast.c
+@@ -423,17 +423,116 @@ validate_persist_mode (const char *key,
+   return TRUE;
+ }
+ 
++static gboolean
++validate_source_label (const char *key,
++                       GVariant *value,
++                       GVariant *options,
++                       GError **error)
++{
++  const char *label = g_variant_get_string (value, NULL);
++  gsize len = strlen (label);
++
++  if (len > 256)
++    {
++      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
++                   "source_label exceeds 256 bytes (%zu)", len);
++      return FALSE;
++    }
++
++  return TRUE;
++}
++
++static gboolean
++validate_restore_policy (const char *key,
++                         GVariant *value,
++                         GVariant *options,
++                         GError **error)
++{
++  GVariantIter iter;
++  const char *child_key;
++  GVariant *child_value;
++
++  g_variant_iter_init (&iter, value);
++  while (g_variant_iter_loop (&iter, "{&sv}", &child_key, &child_value))
++    if (g_str_equal (child_key, "default_action") &&
++        !g_variant_is_of_type (child_value, G_VARIANT_TYPE_UINT32))
++      {
++        g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
++                     "restore_policy.default_action must be uint32");
++        return FALSE;
++      }
++    else if (g_str_equal (child_key, "actions") &&
++             !g_variant_is_of_type (child_value, G_VARIANT_TYPE ("a{su}")))
++      {
++        g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
++                     "restore_policy.actions must be a{su}");
++        return FALSE;
++      }
++
++  return TRUE;
++}
++
+ static XdpOptionKey screen_cast_select_sources_options[] = {
+   { "types", G_VARIANT_TYPE_UINT32, validate_source_types },
+   { "multiple", G_VARIANT_TYPE_BOOLEAN, NULL },
+   { "cursor_mode", G_VARIANT_TYPE_UINT32, validate_cursor_mode },
+   { "restore_token", G_VARIANT_TYPE_STRING, validate_restore_token },
+   { "persist_mode", G_VARIANT_TYPE_UINT32, validate_persist_mode },
++  { "source_label", G_VARIANT_TYPE_STRING, validate_source_label },
++  { "restore_policy", G_VARIANT_TYPE_VARDICT, validate_restore_policy },
+ };
+ 
++static const char *
++restore_failure_reason_to_string (XdpSessionRestoreFailureReason reason)
++{
++  switch (reason)
++    {
++    case XDP_SESSION_RESTORE_FAILURE_TOKEN_NOT_FOUND:
++      return "token_not_found";
++    case XDP_SESSION_RESTORE_FAILURE_PERMISSION_REVOKED:
++      return "permission_revoked";
++    case XDP_SESSION_RESTORE_FAILURE_TOKEN_CONSUMED:
++      return "token_consumed";
++    case XDP_SESSION_RESTORE_FAILURE_NONE:
++    default:
++      return "token_not_found";
++    }
++}
++
++static guint32
++restore_policy_action_for_reason (GVariant   *restore_policy,
++                                  const char *reason)
++{
++  g_autoptr(GVariant) actions = NULL;
++  guint32 action = 0;
++  guint32 default_action = 0;
++  guint32 reason_action = 0;
++
++  if (!restore_policy)
++    return action;
++
++  if (g_variant_lookup (restore_policy,
++                        "default_action",
++                        "u",
++                        &default_action) &&
++      default_action <= 2)
++    action = default_action;
++
++  actions = g_variant_lookup_value (restore_policy,
++                                    "actions",
++                                    G_VARIANT_TYPE ("a{su}"));
++  if (actions &&
++      g_variant_lookup (actions, reason, "u", &reason_action) &&
++      reason_action <= 2)
++    action = reason_action;
++
++  return action;
++}
++
+ static gboolean
+ replace_screen_cast_restore_token_with_data (XdpSession *session,
+                                              GVariant **in_out_options,
++                                             XdpSessionRestoreFailureReason *out_failure_reason,
+                                              GError **error)
+ {
+   g_autoptr(GVariant) options = NULL;
+@@ -465,7 +564,8 @@ replace_screen_cast_restore_token_with_data (XdpSession *session,
+       xdp_session_persistence_replace_restore_token_with_data (session,
+                                                                SCREEN_CAST_TABLE,
+                                                                in_out_options,
+-                                                               &screen_cast_session->restore_token);
++                                                               &screen_cast_session->restore_token,
++                                                               out_failure_reason);
+     }
+   else
+     {
+@@ -586,11 +686,89 @@ handle_select_sources (XdpDbusScreenCast *object,
+    * permission store and / or the GHashTable with transient permissions.
+    * Portal implementations do not have access to the restore token.
+    */
+-  if (!replace_screen_cast_restore_token_with_data (session, &options, &error))
+-    {
+-      g_dbus_method_invocation_return_gerror (invocation, error);
+-      return G_DBUS_METHOD_INVOCATION_HANDLED;
+-    }
++  {
++    gboolean had_restore_token;
++    XdpSessionRestoreFailureReason restore_failure_reason =
++      XDP_SESSION_RESTORE_FAILURE_NONE;
++    g_autoptr(GVariant) restore_policy = NULL;
++
++    had_restore_token = xdp_variant_contains_key (options, "restore_token");
++
++    restore_policy = g_variant_lookup_value (options,
++                                             "restore_policy",
++                                             G_VARIANT_TYPE_VARDICT);
++
++    /* Note: had_restore_token is captured before replace_screen_cast_restore_token_with_data
++     * mutates options. The three outcomes (error/restored/stale) all produce correct
++     * behaviour with the captured value: on error we return early; on successful restore
++     * the "restore_data" key is added; on a stale token neither "restore_token" nor
++     * "restore_data" is set, which is exactly when had_restore_token triggers policy. */
++    if (!replace_screen_cast_restore_token_with_data (session,
++                                                      &options,
++                                                      &restore_failure_reason,
++                                                      &error))
++      {
++        g_dbus_method_invocation_return_gerror (invocation, error);
++        return G_DBUS_METHOD_INVOCATION_HANDLED;
++      }
++
++    if (had_restore_token &&
++        !xdp_variant_contains_key (options, "restore_data"))
++      {
++        const char *reason;
++        guint32 restore_action;
++
++        reason = restore_failure_reason_to_string (restore_failure_reason);
++        restore_action = restore_policy_action_for_reason (restore_policy, reason);
++
++        if (restore_action != 0)
++          {
++            guint response;
++            g_auto(GVariantBuilder) results_builder =
++              G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE_VARDICT);
++            g_auto(GVariantBuilder) failure_builder =
++              G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE_VARDICT);
++
++            g_variant_builder_add (&failure_builder, "{sv}",
++                                   "reason",
++                                   g_variant_new_string (reason));
++            g_variant_builder_add (&failure_builder, "{sv}",
++                                   "action",
++                                   g_variant_new_uint32 (restore_action));
++            g_variant_builder_add (&failure_builder, "{sv}",
++                                   "token_invalid",
++                                   g_variant_new_boolean (TRUE));
++
++            g_variant_builder_add (&results_builder, "{sv}",
++                                   "restore_failure",
++                                   g_variant_builder_end (&failure_builder));
++
++            if (restore_action == 1)
++              {
++                response = 1;
++              }
++            else
++              {
++                response = 2;
++              }
++
++            xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
++                                             response,
++                                             g_variant_builder_end (&results_builder));
++            xdp_request_unexport (request);
++
++            /* Session close is best-effort: xdp_session_close returns void.
++             * If the underlying D-Bus proxy call fails, the session state is
++             * already unusable from the caller's perspective (they received
++             * the fail response), so best-effort matches the existing semantics. */
++            if (IS_SCREEN_CAST_SESSION (session))
++              xdp_session_close (session, TRUE);
++
++            xdp_dbus_screen_cast_complete_select_sources (object, invocation, request->id);
++            return G_DBUS_METHOD_INVOCATION_HANDLED;
++          }
++      }
++  }
+ 
+   g_object_set_qdata_full (G_OBJECT (request),
+                            quark_request_session,
+@@ -1070,7 +1248,7 @@ on_supported_cursor_modes_changed (GObject *gobject,
+ static void
+ screen_cast_init (ScreenCast *screen_cast)
+ {
+-  xdp_dbus_screen_cast_set_version (XDP_DBUS_SCREEN_CAST (screen_cast), 5);
++  xdp_dbus_screen_cast_set_version (XDP_DBUS_SCREEN_CAST (screen_cast), 6);
+ 
+   g_signal_connect (impl, "notify::supported-source-types",
+                     G_CALLBACK (on_supported_source_types_changed),
+diff --git a/src/xdp-session-persistence.c b/src/xdp-session-persistence.c
+index bc9faa7..3090657 100644
+--- a/src/xdp-session-persistence.c
++++ b/src/xdp-session-persistence.c
+@@ -149,15 +149,40 @@ xdp_session_persistence_delete_persistent_permissions (XdpSession *session,
+     }
+ }
+ 
++static GVariant * xdp_session_persistence_lookup_persistent_permissions (XdpSession *session,
++                                                                         const char *table,
++                                                                         const char *restore_token,
++                                                                         XdpSessionRestoreFailureReason *out_failure_reason);
++
+ GVariant *
+ xdp_session_persistence_get_persistent_permissions (XdpSession *session,
+                                                     const char *table,
+                                                     const char *restore_token)
++{
++  return xdp_session_persistence_lookup_persistent_permissions (session,
++                                                                table,
++                                                                restore_token,
++                                                                NULL);
++}
++
++static void
++set_restore_failure_reason (XdpSessionRestoreFailureReason *out_failure_reason,
++                            XdpSessionRestoreFailureReason reason)
++{
++  if (out_failure_reason)
++    *out_failure_reason = reason;
++}
++
++static GVariant *
++xdp_session_persistence_lookup_persistent_permissions (XdpSession *session,
++                                                       const char *table,
++                                                       const char *restore_token,
++                                                       XdpSessionRestoreFailureReason *out_failure_reason)
+ {
+   g_autoptr(GVariant) perms = NULL;
+   g_autoptr(GVariant) data = NULL;
+   g_autoptr(GError) error = NULL;
+-  const char **permissions;
++  g_auto(GStrv) permissions = NULL;
+ 
+   if (!xdp_dbus_impl_permission_store_call_lookup_sync (xdp_get_permission_store (),
+                                                         table,
+@@ -167,14 +192,31 @@ xdp_session_persistence_get_persistent_permissions (XdpSession *session,
+                                                         NULL,
+                                                         &error))
+     {
++      set_restore_failure_reason (out_failure_reason,
++                                  XDP_SESSION_RESTORE_FAILURE_TOKEN_NOT_FOUND);
+       return NULL;
+     }
+ 
+   if (!perms || !g_variant_lookup (perms, session->app_id, "^a&s", &permissions))
+-    return NULL;
++    {
++      set_restore_failure_reason (out_failure_reason,
++                                  XDP_SESSION_RESTORE_FAILURE_PERMISSION_REVOKED);
++      return NULL;
++    }
++
++  if (xdp_permissions_to_tristate (permissions) != XDP_PERMISSION_YES)
++    {
++      set_restore_failure_reason (out_failure_reason,
++                                  XDP_SESSION_RESTORE_FAILURE_PERMISSION_REVOKED);
++      return NULL;
++    }
+ 
+   if (!data)
+-    return NULL;
++    {
++      set_restore_failure_reason (out_failure_reason,
++                                  XDP_SESSION_RESTORE_FAILURE_TOKEN_CONSUMED);
++      return NULL;
++    }
+ 
+   return g_variant_get_child_value (data, 0);
+ }
+@@ -183,7 +225,8 @@ void
+ xdp_session_persistence_replace_restore_token_with_data (XdpSession *session,
+                                                          const char *table,
+                                                          GVariant **in_out_options,
+-                                                         char **out_restore_token)
++                                                         char **out_restore_token,
++                                                         XdpSessionRestoreFailureReason *out_failure_reason)
+ {
+   GVariantIter options_iter;
+   g_auto(GVariantBuilder) options_builder =
+@@ -191,6 +234,8 @@ xdp_session_persistence_replace_restore_token_with_data (XdpSession *session,
+   char *key;
+   GVariant *value;
+ 
++  set_restore_failure_reason (out_failure_reason, XDP_SESSION_RESTORE_FAILURE_NONE);
++
+   g_variant_iter_init (&options_iter, *in_out_options);
+ 
+   while (g_variant_iter_next (&options_iter, "{&sv}", &key, &value))
+@@ -199,6 +244,8 @@ xdp_session_persistence_replace_restore_token_with_data (XdpSession *session,
+         {
+           g_autofree char *restore_token = NULL;
+           g_autoptr(GVariant) restore_data = NULL;
++          XdpSessionRestoreFailureReason failure_reason =
++            XDP_SESSION_RESTORE_FAILURE_TOKEN_NOT_FOUND;
+ 
+           restore_token = g_variant_dup_string (value, NULL);
+ 
+@@ -220,9 +267,10 @@ xdp_session_persistence_replace_restore_token_with_data (XdpSession *session,
+           else
+             {
+               restore_data =
+-                xdp_session_persistence_get_persistent_permissions (session,
+-                                                                    table,
+-                                                                    restore_token);
++                xdp_session_persistence_lookup_persistent_permissions (session,
++                                                                       table,
++                                                                       restore_token,
++                                                                       &failure_reason);
+               if (restore_data)
+                 {
+                   xdp_session_persistence_delete_persistent_permissions (session,
+@@ -239,6 +287,13 @@ xdp_session_persistence_replace_restore_token_with_data (XdpSession *session,
+                                      "restore_data", restore_data);
+               *out_restore_token = g_steal_pointer (&restore_token);
+             }
++          else
++            {
++              if (restore_data)
++                failure_reason = XDP_SESSION_RESTORE_FAILURE_TOKEN_CONSUMED;
++
++              set_restore_failure_reason (out_failure_reason, failure_reason);
++            }
+         }
+       else
+         {
+diff --git a/src/xdp-session-persistence.h b/src/xdp-session-persistence.h
+index 2ee3530..334f4b7 100644
+--- a/src/xdp-session-persistence.h
++++ b/src/xdp-session-persistence.h
+@@ -29,6 +29,14 @@ typedef enum _XdpSessionPersistenceMode
+   XDP_SESSION_PERSISTENCE_MODE_PERSISTENT = 2,
+ } XdpSessionPersistenceMode;
+ 
++typedef enum _XdpSessionRestoreFailureReason
++{
++  XDP_SESSION_RESTORE_FAILURE_NONE = 0,
++  XDP_SESSION_RESTORE_FAILURE_TOKEN_NOT_FOUND,
++  XDP_SESSION_RESTORE_FAILURE_PERMISSION_REVOKED,
++  XDP_SESSION_RESTORE_FAILURE_TOKEN_CONSUMED,
++} XdpSessionRestoreFailureReason;
++
+ void xdp_session_persistence_set_transient_permissions (XdpSession *session,
+                                                         const char *restore_token,
+                                                         GVariant *restore_data);
+@@ -57,7 +65,8 @@ GVariant * xdp_session_persistence_get_persistent_permissions (XdpSession *sessi
+ void xdp_session_persistence_replace_restore_token_with_data (XdpSession *session,
+                                                               const char *table,
+                                                               GVariant **in_out_options,
+-                                                              char **out_restore_token);
++                                                              char **out_restore_token,
++                                                              XdpSessionRestoreFailureReason *out_failure_reason);
+ 
+ void xdp_session_persistence_replace_restore_data_with_token (XdpSession *session,
+                                                               const char *table,
+-- 
+2.53.0
+

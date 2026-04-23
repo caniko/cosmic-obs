@@ -2,7 +2,7 @@ mod helpers;
 
 use std::collections::HashMap;
 
-use screencast_portal_mock::{NormalSession, OldPortal, RestoreFailMode};
+use screencast_portal_mock::{NormalSession, OldPortal, RestoreAction};
 use zbus::zvariant::{OwnedValue, Value};
 
 #[tokio::test]
@@ -36,8 +36,8 @@ async fn unpatched_client_against_v6_portal() {
     handle.assert_no_source_label(0);
     let calls = handle.calls();
     assert_eq!(
-        calls[0].restore_fail_mode, None,
-        "old client should not send restore_fail_mode"
+        calls[0].restore_policy, None,
+        "old client should not send restore_policy"
     );
 }
 
@@ -59,8 +59,8 @@ async fn v6_client_against_v5_portal() {
         OwnedValue::try_from(Value::new("OBS Camera".to_string())).unwrap(),
     );
     opts.insert(
-        "restore_fail_mode".into(),
-        OwnedValue::try_from(Value::U32(1)).unwrap(),
+        "restore_policy".into(),
+        helpers::restore_policy_value(Some(1), &[]),
     );
 
     let (resp, _) = helpers::select_sources(&client, &session, opts).await;
@@ -90,8 +90,8 @@ async fn client_checks_version_before_sending_v6_keys() {
             OwnedValue::try_from(Value::new("OBS Camera".to_string())).unwrap(),
         );
         opts.insert(
-            "restore_fail_mode".into(),
-            OwnedValue::try_from(Value::U32(1)).unwrap(),
+            "restore_policy".into(),
+            helpers::restore_policy_value(Some(1), &[]),
         );
     }
 
@@ -102,8 +102,8 @@ async fn client_checks_version_before_sending_v6_keys() {
     handle.assert_no_source_label(0);
     let calls = handle.calls();
     assert_eq!(
-        calls[0].restore_fail_mode, None,
-        "client should not send restore_fail_mode to v5 portal"
+        calls[0].restore_policy, None,
+        "client should not send restore_policy to v5 portal"
     );
 }
 
@@ -124,8 +124,8 @@ async fn client_sends_v6_keys_when_version_sufficient() {
             OwnedValue::try_from(Value::new("Desktop Capture".to_string())).unwrap(),
         );
         opts.insert(
-            "restore_fail_mode".into(),
-            OwnedValue::try_from(Value::U32(1)).unwrap(),
+            "restore_policy".into(),
+            helpers::restore_policy_value(Some(1), &[]),
         );
     }
 
@@ -138,7 +138,7 @@ async fn client_sends_v6_keys_when_version_sufficient() {
 
     handle.assert_call_count(1);
     handle.assert_source_label(0, "Desktop Capture");
-    handle.assert_restore_fail_mode(0, RestoreFailMode::Skip);
+    handle.assert_restore_default_action(0, RestoreAction::Skip);
 }
 
 /// Full OBS-like flow: multiple sources, each with a unique label, version-gated.
@@ -157,8 +157,8 @@ async fn obs_like_multi_source_with_version_check() {
                 OwnedValue::try_from(Value::new(label.to_string())).unwrap(),
             );
             opts.insert(
-                "restore_fail_mode".into(),
-                OwnedValue::try_from(Value::U32(1)).unwrap(),
+                "restore_policy".into(),
+                helpers::restore_policy_value(Some(1), &[]),
             );
         }
         let (resp, _) = helpers::select_sources(&client, &session, opts).await;
@@ -168,6 +168,6 @@ async fn obs_like_multi_source_with_version_check() {
     handle.assert_call_count(3);
     for (i, label) in labels.iter().enumerate() {
         handle.assert_source_label(i, label);
-        handle.assert_restore_fail_mode(i, RestoreFailMode::Skip);
+        handle.assert_restore_default_action(i, RestoreAction::Skip);
     }
 }

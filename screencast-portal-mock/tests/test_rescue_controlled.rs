@@ -14,23 +14,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use screencast_portal_mock::{ExternallyTriggeredRescue, RestoreFailReason};
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 /// Build a `SelectSources` options dict with a stale restore token and
-/// `restore_fail_mode=Prompt` (0). Under Prompt the mock portal converts
+/// `restore_policy.default_action=Prompt` (0). Under Prompt the mock portal converts
 /// the scenario's `Err(RestoreFailure)` into `response=0`, so the caller
 /// proceeds to Start where the rescue await happens.
 fn prompt_with_stale_token() -> HashMap<String, OwnedValue> {
-    let mut opts = HashMap::new();
-    opts.insert(
-        "restore_token".into(),
-        OwnedValue::try_from(Value::new("stale-token".to_string())).unwrap(),
-    );
-    opts.insert(
-        "restore_fail_mode".into(),
-        OwnedValue::try_from(Value::U32(0)).unwrap(),
-    );
-    opts
+    helpers::token_and_policy(Some(0), &[])
 }
 
 /// Poll `start_fut.is_finished()` for ~50ms to confirm Start is still

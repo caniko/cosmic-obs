@@ -1,16 +1,16 @@
 use proptest::prelude::*;
-use screencast_portal_mock::{RestoreFailMode, SourceTypes};
+use screencast_portal_mock::{RestoreAction, SourceTypes};
 
 proptest! {
     #[test]
-    fn restore_fail_mode_round_trip(v in 0u32..=2) {
-        let policy = RestoreFailMode::try_from(v).unwrap();
-        prop_assert_eq!(policy as u32, v);
+    fn restore_action_round_trip(v in 0u32..=2) {
+        let action = RestoreAction::try_from(v).unwrap();
+        prop_assert_eq!(action as u32, v);
     }
 
     #[test]
-    fn restore_fail_mode_rejects_invalid(v in 3u32..=u32::MAX) {
-        prop_assert!(RestoreFailMode::try_from(v).is_err());
+    fn restore_action_rejects_invalid(v in 3u32..=u32::MAX) {
+        prop_assert!(RestoreAction::try_from(v).is_err());
     }
 
     #[test]

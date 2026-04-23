@@ -261,8 +261,8 @@ pub struct DelayedRestore {
 impl Scenario for DelayedRestore {
     async fn on_select_sources(&self, _options: &Options) -> Result<ExtraResults, RestoreFailure> {
         // Report the token failure — the portal layer will convert this into
-        // the appropriate response according to the caller's restore_fail_mode.
-        // For rescue semantics the caller is expected to send mode=Prompt, so
+        // the appropriate response according to the caller's restore_policy.
+        // For rescue semantics the caller is expected to send action=Prompt, so
         // the portal fires response=0 and SelectSources appears to succeed;
         // the rescue delay is then paid during `on_start`.
         Err(RestoreFailure {
@@ -276,8 +276,8 @@ impl Scenario for DelayedRestore {
     }
 }
 
-/// `on_start` returns response=2 with empty results (no `restore_failed` key).
-/// This simulates an error response that lacks the expected flag.
+/// `on_start` returns response=2 with empty results (no `restore_failure` key).
+/// This simulates an error response that lacks the expected failure object.
 pub struct ErrorWithoutFlag;
 
 #[async_trait]
@@ -310,7 +310,7 @@ pub enum RescueOutcome {
     /// Rescue succeeded — Start fires `response=0` with the default stream.
     Succeed,
     /// Rescue succeeded with a custom `StartResult` (multi-stream tests,
-    /// explicit `restore_failed` flag, etc.).
+    /// explicit `restore_failure` object, etc.).
     SucceedWith(StartResult),
     /// Rescue resolved to failure — Start fires the given response code
     /// (1 = cancelled, 2 = error) with empty results.
@@ -348,7 +348,7 @@ impl RescueController {
 /// Scenario whose `on_start` blocks on an externally-triggered rescue.
 ///
 /// `on_select_sources` returns `Err(RestoreFailure)` so that under
-/// `restore_fail_mode=Prompt` the portal converts it to `response=0` and
+/// `restore_policy.default_action=Prompt` the portal converts it to `response=0` and
 /// the caller proceeds to Start, where the rescue await happens. Pair with
 /// `RescueController` to drive the rescue outcome from the test.
 ///

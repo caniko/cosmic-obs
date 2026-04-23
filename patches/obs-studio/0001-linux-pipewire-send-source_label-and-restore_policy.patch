@@ -1,0 +1,171 @@
+From ba73d2ed9b7fe45135194fafd442d4faafbb45b2 Mon Sep 17 00:00:00 2001
+From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
+Date: Thu, 23 Apr 2026 10:46:51 +0200
+Subject: [PATCH] linux-pipewire: send source_label and restore_policy
+
+---
+ plugins/linux-pipewire/data/locale/en-US.ini |  4 ++
+ plugins/linux-pipewire/screencast-portal.c   | 64 +++++++++++++++++++-
+ 2 files changed, 66 insertions(+), 2 deletions(-)
+
+diff --git a/plugins/linux-pipewire/data/locale/en-US.ini b/plugins/linux-pipewire/data/locale/en-US.ini
+index a7eedd1..2c2908a 100644
+--- a/plugins/linux-pipewire/data/locale/en-US.ini
++++ b/plugins/linux-pipewire/data/locale/en-US.ini
+@@ -8,4 +8,8 @@ PipeWireSelectWindow="Select Window"
+ PipeWireWindowCapture="Window Capture (PipeWire)"
+ PipeWireSelectScreenCast="Open Selector"
+ ShowCursor="Show Cursor"
++RestorePolicyAction="On restore failure"
++RestorePolicyAction.Prompt="Prompt user"
++RestorePolicyAction.Skip="Skip silently"
++RestorePolicyAction.Error="Report error"
+ VideoFormat="Video Format"
+diff --git a/plugins/linux-pipewire/screencast-portal.c b/plugins/linux-pipewire/screencast-portal.c
+index d5fe531..4f02f55 100644
+--- a/plugins/linux-pipewire/screencast-portal.c
++++ b/plugins/linux-pipewire/screencast-portal.c
+@@ -57,6 +57,7 @@ struct screencast_portal_capture {
+ 
+ 	obs_pipewire *obs_pw;
+ 	obs_pipewire_stream *obs_pw_stream;
++	uint32_t restore_action;
+ };
+ 
+ /* ------------------------------------------------- */
+@@ -211,6 +212,29 @@ static void open_pipewire_remote(struct screencast_portal_capture *capture)
+ 
+ /* ------------------------------------------------- */
+ 
++static bool handle_restore_failure(struct screencast_portal_capture *capture, GVariant *result, const char *phase)
++{
++	GVariant *restore_failure = g_variant_lookup_value(result, "restore_failure", G_VARIANT_TYPE_VARDICT);
++	if (!restore_failure)
++		return false;
++
++	const char *reason = NULL;
++	gboolean token_invalid = FALSE;
++	g_variant_lookup(restore_failure, "reason", "&s", &reason);
++	g_variant_lookup(restore_failure, "token_invalid", "b", &token_invalid);
++
++	blog(LOG_WARNING, "[pipewire] Failed to %s: restore failure reason=%s token_invalid=%s", phase,
++	     reason ? reason : "unknown", token_invalid ? "true" : "false");
++
++	if (token_invalid) {
++		g_clear_pointer(&capture->restore_token, bfree);
++		obs_source_save(capture->source);
++	}
++
++	g_variant_unref(restore_failure);
++	return true;
++}
++
+ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
+ {
+ 	struct screencast_portal_capture *capture = user_data;
+@@ -224,7 +248,8 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
+ 	g_variant_get(parameters, "(u@a{sv})", &response, &result);
+ 
+ 	if (response != 0) {
+-		blog(LOG_WARNING, "[pipewire] Failed to start screencast, denied or cancelled by user");
++		if (!handle_restore_failure(capture, result, "start screencast"))
++			blog(LOG_WARNING, "[pipewire] Failed to start screencast, denied or cancelled by user");
+ 		return;
+ 	}
+ 
+@@ -320,7 +345,8 @@ static void on_select_source_response_received_cb(GVariant *parameters, void *us
+ 	g_variant_get(parameters, "(u@a{sv})", &response, &ret);
+ 
+ 	if (response != 0) {
+-		blog(LOG_WARNING, "[pipewire] Failed to select source, denied or cancelled by user");
++		if (!handle_restore_failure(capture, ret, "select source"))
++			blog(LOG_WARNING, "[pipewire] Failed to select source, denied or cancelled by user");
+ 		return;
+ 	}
+ 
+@@ -377,6 +403,22 @@ static void select_source(struct screencast_portal_capture *capture)
+ 		}
+ 	}
+ 
++	if (get_screencast_version() >= 6) {
++		const char *source_name = obs_source_get_name(capture->source);
++		if (source_name && *source_name)
++			g_variant_builder_add(&builder, "{sv}", "source_label",
++					      g_variant_new_string(source_name));
++
++		if (capture->restore_token && *capture->restore_token) {
++			GVariantBuilder policy;
++			g_variant_builder_init(&policy, G_VARIANT_TYPE_VARDICT);
++			g_variant_builder_add(&policy, "{sv}", "default_action",
++					      g_variant_new_uint32(capture->restore_action));
++			g_variant_builder_add(&builder, "{sv}", "restore_policy",
++					      g_variant_builder_end(&policy));
++		}
++	}
++
+ 	g_dbus_proxy_call(get_screencast_portal_proxy(), "SelectSources",
+ 			  g_variant_new("(oa{sv})", capture->session_handle, &builder), G_DBUS_CALL_FLAGS_NONE, -1,
+ 			  capture->cancellable, on_source_selected_cb, NULL);
+@@ -517,6 +559,9 @@ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_MONITOR;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
++					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
++					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+ 	capture->source = source;
+ 
+ 	init_screencast_capture(capture);
+@@ -531,6 +576,9 @@ static void *screencast_portal_window_capture_create(obs_data_t *settings, obs_s
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_WINDOW;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
++					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
++					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+ 	capture->source = source;
+ 
+ 	init_screencast_capture(capture);
+@@ -546,6 +594,9 @@ static void *screencast_portal_capture_create(obs_data_t *settings, obs_source_t
+ 	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_UNIFIED;
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
+ 	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
++	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
++					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
++					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
+ 	capture->source = source;
+ 
+ 	init_screencast_capture(capture);
+@@ -588,6 +639,7 @@ static void screencast_portal_capture_get_defaults(obs_data_t *settings)
+ {
+ 	obs_data_set_default_bool(settings, "ShowCursor", true);
+ 	obs_data_set_default_string(settings, "RestoreToken", NULL);
++	obs_data_set_default_int(settings, "RestorePolicyAction", 1);
+ }
+ 
+ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
+@@ -614,6 +666,13 @@ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
+ 	obs_properties_add_button2(properties, "Reload", obs_module_text(reload_string_id), reload_session_cb, capture);
+ 	obs_properties_add_bool(properties, "ShowCursor", obs_module_text("ShowCursor"));
+ 
++	obs_property_t *mode_prop = obs_properties_add_list(properties, "RestorePolicyAction",
++							    obs_module_text("RestorePolicyAction"), OBS_COMBO_TYPE_LIST,
++							    OBS_COMBO_FORMAT_INT);
++	obs_property_list_add_int(mode_prop, obs_module_text("RestorePolicyAction.Prompt"), 0);
++	obs_property_list_add_int(mode_prop, obs_module_text("RestorePolicyAction.Skip"), 1);
++	obs_property_list_add_int(mode_prop, obs_module_text("RestorePolicyAction.Error"), 2);
++
+ 	return properties;
+ }
+ 
+@@ -622,6 +681,7 @@ static void screencast_portal_capture_update(void *data, obs_data_t *settings)
+ 	struct screencast_portal_capture *capture = data;
+ 
+ 	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
++	capture->restore_action = (uint32_t)obs_data_get_int(settings, "RestorePolicyAction");
+ 
+ 	if (capture->obs_pw_stream)
+ 		obs_pipewire_stream_set_cursor_visible(capture->obs_pw_stream, capture->cursor_visible);
+-- 
+2.53.0
+

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_lite::StreamExt;
 use screencast_portal_mock::{MockPortal, MockPortalHandle, PrivateBus, Scenario};
-use zbus::zvariant::{OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str, Value};
 
 /// Set up a private bus, start the mock portal, and return a client connection.
 pub async fn setup<S: Scenario>(scenario: S) -> (PrivateBus, MockPortalHandle, zbus::Connection) {
@@ -75,6 +75,46 @@ pub async fn select_sources(
     recv_response_for(&mut stream, &request_path).await
 }
 
+/// Call `SelectSources`, wait for Response, then wait for Session::Closed.
+pub async fn select_sources_and_wait_closed(
+    client: &zbus::Connection,
+    session_handle: &OwnedObjectPath,
+    extra_options: HashMap<String, OwnedValue>,
+) -> (u32, HashMap<String, OwnedValue>) {
+    let response_rule = response_match_rule();
+    let mut response_stream = zbus::MessageStream::for_match_rule(response_rule, client, Some(64))
+        .await
+        .expect("create response message stream");
+
+    let closed_rule = session_closed_match_rule();
+    let mut closed_stream = zbus::MessageStream::for_match_rule(closed_rule, client, Some(64))
+        .await
+        .expect("create session closed message stream");
+
+    let proxy = screencast_proxy(client).await;
+    let request_path: OwnedObjectPath = proxy
+        .call("SelectSources", &(session_handle.clone(), extra_options))
+        .await
+        .expect("SelectSources call");
+
+    let response = recv_response_for(&mut response_stream, &request_path).await;
+    recv_session_closed_for(&mut closed_stream, session_handle).await;
+    response
+}
+
+/// Call `SelectSources` and return the expected D-Bus error.
+pub async fn select_sources_error(
+    client: &zbus::Connection,
+    session_handle: &OwnedObjectPath,
+    extra_options: HashMap<String, OwnedValue>,
+) -> zbus::Error {
+    let proxy = screencast_proxy(client).await;
+    proxy
+        .call::<_, _, OwnedObjectPath>("SelectSources", &(session_handle.clone(), extra_options))
+        .await
+        .expect_err("SelectSources should fail")
+}
+
 /// Subscribe, call `Start`, wait for Response.
 pub async fn start_session(
     client: &zbus::Connection,
@@ -95,6 +135,19 @@ pub async fn start_session(
     recv_response_for(&mut stream, &request_path).await
 }
 
+/// Call `Start` and return the expected D-Bus error.
+pub async fn start_session_error(
+    client: &zbus::Connection,
+    session_handle: &OwnedObjectPath,
+) -> zbus::Error {
+    let proxy = screencast_proxy(client).await;
+    let options: HashMap<String, OwnedValue> = HashMap::new();
+    proxy
+        .call::<_, _, OwnedObjectPath>("Start", &(session_handle.clone(), String::new(), options))
+        .await
+        .expect_err("Start should fail")
+}
+
 /// Get the version property from the ScreenCast interface.
 pub async fn get_version(client: &zbus::Connection) -> u32 {
     let proxy = screencast_proxy(client).await;
@@ -103,6 +156,78 @@ pub async fn get_version(client: &zbus::Connection) -> u32 {
         .await
         .expect("get version property");
     u32::try_from(&version).expect("version is u32")
+}
+
+pub fn restore_policy_value(default_action: Option<u32>, actions: &[(&str, u32)]) -> OwnedValue {
+    let mut policy: HashMap<String, OwnedValue> = HashMap::new();
+    if let Some(default_action) = default_action {
+        policy.insert(
+            "default_action".into(),
+            OwnedValue::try_from(Value::U32(default_action)).unwrap(),
+        );
+    }
+
+    if !actions.is_empty() {
+        let actions: HashMap<String, u32> = actions
+            .iter()
+            .map(|(reason, action)| ((*reason).to_string(), *action))
+            .collect();
+        policy.insert("actions".into(), OwnedValue::from(actions));
+    }
+
+    OwnedValue::from(policy)
+}
+
+pub fn token_and_policy(
+    default_action: Option<u32>,
+    actions: &[(&str, u32)],
+) -> HashMap<String, OwnedValue> {
+    let mut opts = HashMap::new();
+    opts.insert(
+        "restore_token".into(),
+        OwnedValue::try_from(Value::new("stale-token".to_string())).unwrap(),
+    );
+    opts.insert(
+        "restore_policy".into(),
+        restore_policy_value(default_action, actions),
+    );
+    opts
+}
+
+pub fn restore_failure(results: &HashMap<String, OwnedValue>) -> HashMap<String, OwnedValue> {
+    results
+        .get("restore_failure")
+        .expect("restore_failure key should be present")
+        .clone()
+        .try_into()
+        .expect("restore_failure should be a{sv}")
+}
+
+pub fn restore_failure_reason(failure: &HashMap<String, OwnedValue>) -> String {
+    failure
+        .get("reason")
+        .expect("restore_failure.reason should be present")
+        .downcast_ref::<Str<'_>>()
+        .expect("restore_failure.reason should be string")
+        .to_string()
+}
+
+pub fn restore_failure_action(failure: &HashMap<String, OwnedValue>) -> u32 {
+    u32::try_from(
+        failure
+            .get("action")
+            .expect("restore_failure.action should be present"),
+    )
+    .expect("restore_failure.action should be u32")
+}
+
+pub fn restore_failure_token_invalid(failure: &HashMap<String, OwnedValue>) -> bool {
+    bool::try_from(
+        failure
+            .get("token_invalid")
+            .expect("restore_failure.token_invalid should be present"),
+    )
+    .expect("restore_failure.token_invalid should be bool")
 }
 
 async fn screencast_proxy(client: &zbus::Connection) -> zbus::Proxy<'_> {
@@ -123,6 +248,17 @@ fn response_match_rule() -> zbus::MatchRule<'static> {
         .interface("org.freedesktop.portal.Request")
         .unwrap()
         .member("Response")
+        .unwrap()
+        .build()
+}
+
+/// Build a match rule for any Closed signal on the Session interface.
+fn session_closed_match_rule() -> zbus::MatchRule<'static> {
+    zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.portal.Session")
+        .unwrap()
+        .member("Closed")
         .unwrap()
         .build()
 }
@@ -148,6 +284,26 @@ async fn recv_response_for(
                 let (response, results): (u32, HashMap<String, OwnedValue>) =
                     body.deserialize().expect("deserialize Response body");
                 return (response, results);
+            }
+        }
+    }
+}
+
+/// Wait for a Closed signal matching the given session path, with timeout.
+async fn recv_session_closed_for(stream: &mut zbus::MessageStream, session_path: &OwnedObjectPath) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline - tokio::time::Instant::now();
+        let next = tokio::time::timeout(remaining, stream.next()).await;
+        let msg = next
+            .expect("session Closed signal timed out")
+            .expect("stream ended")
+            .expect("message error");
+
+        let header = msg.header();
+        if let Some(path) = header.path() {
+            if path.as_str() == session_path.as_str() {
+                return;
             }
         }
     }

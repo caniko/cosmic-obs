@@ -9,7 +9,13 @@ ScreenCast portal **RFC v6**:
 | Key | Type | Description |
 |-----|------|-------------|
 | `source_label` | `string` | Human-readable hint identifying the application-level source |
-| `restore_fail_mode` | `u32` | What to do when a restore token fails: `0` = prompt, `1` = skip, `2` = error |
+| `restore_policy` | `a{sv}` | Per-reason restore policy with `default_action` and optional `actions` overrides |
+
+`restore_policy.default_action` and all reason-specific `actions` use `0` =
+prompt, `1` = skip, and `2` = error. Policy-triggered skip/error responses
+include a `restore_failure` result object with `reason`, `action`, and
+`token_invalid`, emit `org.freedesktop.portal.Session::Closed`, and reject
+later `Start` calls for that session.
 
 ## Quick start
 
@@ -83,8 +89,10 @@ helpers:
 - `assert_call_count(n)` — exactly `n` calls were recorded
 - `assert_source_label(index, label)` — call at `index` has the given label
 - `assert_no_source_label(index)` — call at `index` has no label
-- `assert_restore_fail_mode(index, policy)` — call at `index` has the given policy
-- `assert_no_prompts()` — no call used `restore_fail_mode = Prompt`
+- `assert_restore_default_action(index, action)` — call at `index` has the given default action
+- `assert_restore_reason_action(index, reason, action)` — call at `index` has the given reason-specific action
+- `assert_no_restore_policy(index)` — call at `index` has no restore policy
+- `assert_no_prompts()` — no call used `restore_policy.default_action = Prompt`
 - `wait_for_calls(n, timeout)` — async wait until `n` calls are recorded
 - `calls()` — snapshot of all recorded calls
 

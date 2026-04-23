@@ -64,8 +64,8 @@ async fn error_response_without_flag() {
     let (resp, results) = helpers::start_session(&client, &session).await;
     assert_eq!(resp, 2, "ErrorWithoutFlag should fire response=2");
     assert!(
-        !results.contains_key("restore_failed"),
-        "results should NOT contain restore_failed key"
+        !results.contains_key("restore_failure"),
+        "results should NOT contain restore_failure key"
     );
 }
 
@@ -84,7 +84,7 @@ async fn start_results_verification() {
         "results should contain streams"
     );
     assert!(
-        !results.contains_key("restore_failed"),
-        "results should NOT contain restore_failed"
+        !results.contains_key("restore_failure"),
+        "results should NOT contain restore_failure"
     );
 }
