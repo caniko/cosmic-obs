@@ -716,7 +716,7 @@ index 22c33f1..f6399bf 100644
 -        .on_press(msg);
 +        .on_press(select_msg);
      let mut children = Vec::new();
-     children.push(icon.as_cosmic_icon().size(24).into());
+     children.push(icon.as_cosmic_icon().icon().size(24).into());
      children.push(button.into());
 -    // TODO
      if is_selected {
