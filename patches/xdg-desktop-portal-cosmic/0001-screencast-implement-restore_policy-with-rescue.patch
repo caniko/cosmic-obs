@@ -1,119 +1,76 @@
-From 28bd7caaaf932bfaf112ef291aebbc1b32823f98 Mon Sep 17 00:00:00 2001
+From 57c3808ccde3d6f6ad9363c8d9a8ee3d2ba8c5ef Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
-Date: Fri, 3 Apr 2026 17:02:28 +0200
-Subject: [PATCH] screencast: zero-cost rescue with user-chosen matching mode
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
+Date: Tue, 28 Apr 2026 12:45:05 +0200
+Subject: [PATCH] screencast: restore with regex rescue aliases
 
-When a restore token resolves to restore_data but the target window is
-not yet running, the backend now checks restore_policy for the
-source_unavailable reason:
-
-  action 0 (prompt): show picker dialog as before
-  action 1 (skip):   register rescue hook — wait up to 30s for
-                      the window to appear; if session closed, cancel
-  action 2 (error):  same as skip, but return restore_failure on
-                      session close
-
-The rescue mechanism uses a zero-cost hook system: PendingRescue structs
-are stored in a Vec and checked inside the existing Wayland toplevel
-event handler. No tokio tasks, no futures parked, no polling. Dead
-rescues (session closed) are purged via oneshot::Sender::is_closed().
-
-New: user-chosen rescue mode per window, selected in the picker dialog:
-
-  Exact (0): only match by compositor identifier (same window instance)
-  App   (1): match by app_id — grab any window from the same app
-  Title (2): match by app_id + window title
-
-The matching uses a tiered fallback: exact identifier first, then the
-user-chosen mode. Empty app_id guards prevent false positives for
-XWayland windows without WM_CLASS.
-
-Restore data bumped from version 1 to 2 to store app_ids, titles, and
-rescue_modes. V1 data deserializes with padded vecs (exact-only matching).
-
-Also adds source_label and restore_policy to SelectSourcesOptions,
-and bumps the backend interface version from 4 to 6.
-
-Improvements over initial RFC draft:
-- source_label sanitized: control chars stripped, 256-byte truncation
-- V1/V2 parallel vec lengths validated at deserialization
-- Rescue check-and-register is atomic (no TOCTOU race)
-- Pending rescues capped at 64 (prevents resource exhaustion)
-- Rescue timeout: 30 seconds (prevents indefinite hangs)
-- Bounds-safe indexing for rescue mode updates in dialog
 ---
- i18n/en/xdg_desktop_portal_cosmic.ftl |   3 +
+ Cargo.toml                            |   1 +
+ i18n/en/xdg_desktop_portal_cosmic.ftl |   6 +
  src/main.rs                           |   4 +
- src/screencast.rs                     | 300 ++++++++++++++++++++++++--
- src/screencast_dialog.rs              | 112 ++++++++--
- src/wayland/mod.rs                    |  64 ++++++
- 5 files changed, 448 insertions(+), 35 deletions(-)
+ src/screencast.rs                     | 546 ++++++++++++++++++++++++--
+ src/screencast_dialog.rs              | 305 +++++++++++++-
+ src/wayland/mod.rs                    |  64 +++
+ 6 files changed, 886 insertions(+), 40 deletions(-)
 
+diff --git a/Cargo.toml b/Cargo.toml
+index 643d8ec..3f8d06f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -32,2 +32,3 @@ pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", featur
+ png = "0.18"
++regex = "1.12.2"
+ rustix = { version = "1.1", features = ["fs"] }
 diff --git a/i18n/en/xdg_desktop_portal_cosmic.ftl b/i18n/en/xdg_desktop_portal_cosmic.ftl
-index 5e6fe12..351bc1c 100644
+index 5e6fe12..aa60c0c 100644
 --- a/i18n/en/xdg_desktop_portal_cosmic.ftl
 +++ b/i18n/en/xdg_desktop_portal_cosmic.ftl
-@@ -13,3 +13,6 @@ share-screen = Share your screen
- unknown-application = Unknown Application
- output = Output
+@@ -15 +15,7 @@ output = Output
  window = Window
 +rescue-exact = This window only
 +rescue-app = Any window from this app
 +rescue-title = Window with this title
++rescue-aliases = Rescue title aliases
++rescue-aliases-placeholder = Regex aliases, one per line. Prefix with any: to match any app.
++rescue-invalid-regex = Invalid regex alias
 diff --git a/src/main.rs b/src/main.rs
 index 7ef3cf4..f762e6d 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -35,6 +35,7 @@ enum PortalResponse<T: zvariant::Type + serde::Serialize> {
-     Success(T),
-     Cancelled,
+@@ -37,2 +37,3 @@ enum PortalResponse<T: zvariant::Type + serde::Serialize> {
      Other,
 +    OtherWithResults(T),
  }
- 
- impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T> {
-@@ -51,6 +52,9 @@ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T
-                 HashMap::<String, zvariant::Value>::new(),
-             )
+@@ -53,2 +54,5 @@ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T
                  .serialize(serializer),
 +            Self::OtherWithResults(res) => {
 +                (PORTAL_RESPONSE_OTHER, res).serialize(serializer)
 +            }
          }
-     }
- }
 diff --git a/src/screencast.rs b/src/screencast.rs
-index b31f604..8d589d7 100644
+index b31f604..6eb8560 100644
 --- a/src/screencast.rs
 +++ b/src/screencast.rs
-@@ -2,7 +2,7 @@
- 
- use ashpd::{desktop::screencast::SourceType, enumflags2::BitFlags};
+@@ -4,3 +4,4 @@ use ashpd::{desktop::screencast::SourceType, enumflags2::BitFlags};
  use futures::stream::{FuturesOrdered, StreamExt};
 -use std::{collections::HashMap, mem};
++use regex::RegexBuilder;
 +use std::{collections::HashMap, mem, time::Duration};
  use tokio::sync::mpsc::Sender;
- use zbus::zvariant;
+@@ -8,3 +9,3 @@ use zbus::zvariant;
  
-@@ -10,6 +10,7 @@ use crate::screencast_dialog::{self, CaptureSources};
+-use crate::screencast_dialog::{self, CaptureSources};
++use crate::screencast_dialog::{self, CaptureSources, RestoreMatchRule, RestoreMatchScope};
  use crate::screencast_thread::ScreencastThread;
- use crate::subscription;
+@@ -12,2 +13,3 @@ use crate::subscription;
  use crate::wayland::{CaptureSource, WaylandHelper};
 +use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
  use crate::{PortalResponse, Request};
- 
- const CURSOR_MODE_HIDDEN: u32 = 1;
-@@ -26,16 +27,25 @@ struct CreateSessionResult {
-     session_id: String,
- }
+@@ -28,6 +30,15 @@ struct CreateSessionResult {
  
 +/// Rescue mode controls how the portal matches windows after an app restart.
-+const RESCUE_MODE_EXACT: u32 = 0;
-+const RESCUE_MODE_APP: u32 = 1;
-+const RESCUE_MODE_TITLE: u32 = 2;
++pub const RESCUE_MODE_EXACT: u32 = 0;
++pub const RESCUE_MODE_APP: u32 = 1;
++pub const RESCUE_MODE_TITLE: u32 = 2;
 +
  #[derive(Clone)]
 -struct PersistedCaptureSources {
@@ -123,61 +80,68 @@ index b31f604..8d589d7 100644
 +    pub toplevel_app_ids: Vec<String>,
 +    pub toplevel_titles: Vec<String>,
 +    pub rescue_modes: Vec<u32>,
++    pub rescue_match_rules: Vec<Vec<RestoreMatchRule>>,
  }
- 
+@@ -35,5 +46,7 @@ struct PersistedCaptureSources {
  impl PersistedCaptureSources {
 -    fn from_capture_sources(
 +    pub(crate) fn from_capture_sources(
          wayland_helper: &WaylandHelper,
          sources: &CaptureSources,
 +        rescue_modes: &[u32],
++        source_match_rules: &[RestoreMatchRule],
      ) -> Option<Self> {
-         let mut outputs = Vec::new();
-         for handle in &sources.outputs {
-@@ -44,33 +54,117 @@ impl PersistedCaptureSources {
-         }
- 
+@@ -46,2 +59,4 @@ impl PersistedCaptureSources {
          let mut toplevels = Vec::new();
 +        let mut toplevel_app_ids = Vec::new();
 +        let mut toplevel_titles = Vec::new();
          let toplevel_infos = wayland_helper.toplevels();
-         for handle in &sources.toplevels {
-             let info = toplevel_infos
-                 .iter()
-                 .find(|t| t.foreign_toplevel == *handle)?;
+@@ -52,8 +67,42 @@ impl PersistedCaptureSources {
              toplevels.push(info.identifier.clone());
 +            toplevel_app_ids.push(info.app_id.clone());
 +            toplevel_titles.push(info.title.clone());
++        }
++
++        let default_mode = if source_match_rules.is_empty() {
++            RESCUE_MODE_APP
++        } else {
++            RESCUE_MODE_TITLE
++        };
++        let mut rescue_modes = rescue_modes.to_vec();
++        rescue_modes.resize(toplevels.len(), default_mode);
++
++        let mut rescue_match_rules = sources.rescue_match_rules.clone();
++        rescue_match_rules.resize_with(toplevels.len(), || source_match_rules.to_vec());
++        for rules in &mut rescue_match_rules {
++            if rules.is_empty() && !source_match_rules.is_empty() {
++                *rules = source_match_rules.to_vec();
++            }
          }
  
 -        Some(Self { outputs, toplevels })
-+        let mut rescue_modes = rescue_modes.to_vec();
-+        rescue_modes.resize(toplevels.len(), RESCUE_MODE_APP);
-+
 +        Some(Self {
 +            outputs,
 +            toplevels,
 +            toplevel_app_ids,
 +            toplevel_titles,
 +            rescue_modes,
++            rescue_match_rules,
 +        })
-+    }
-+
-+    pub(crate) fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
-+        let toplevel_infos = wayland_helper.toplevels();
-+        self.to_capture_sources_with(&toplevel_infos, wayland_helper)
      }
  
 -    fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
++    pub(crate) fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
++        let toplevel_infos = wayland_helper.toplevels();
++        self.to_capture_sources_with(&toplevel_infos, wayland_helper)
++    }
++
 +    pub(crate) fn to_capture_sources_with(
 +        &self,
 +        toplevel_infos: &[ToplevelInfo],
 +        wayland_helper: &WaylandHelper,
 +    ) -> Option<CaptureSources> {
          let mut outputs = Vec::new();
-         for name in &self.outputs {
-             outputs.push(wayland_helper.output_for_name(name)?);
-         }
+@@ -63,13 +112,124 @@ impl PersistedCaptureSources {
  
 +        // All-or-nothing: if any toplevel fails to match, return None
 +        // and discard the (local) partial results.
@@ -207,6 +171,15 @@ index b31f604..8d589d7 100644
 +
 +            // Mode 2 (Title): app_id + title match
 +            if mode == RESCUE_MODE_TITLE {
++                if let Some(info) = self
++                    .rescue_match_rules
++                    .get(i)
++                    .and_then(|rules| match_title_regex_rules(rules, app_id, toplevel_infos))
++                {
++                    toplevels.push(info.foreign_toplevel.clone());
++                    continue;
++                }
++
 +                if let (Some(aid), Some(t)) = (app_id, title) {
 +                    if !aid.is_empty() {
 +                        if let Some(info) = toplevel_infos
@@ -257,28 +230,81 @@ index b31f604..8d589d7 100644
 +            outputs,
 +            toplevels,
 +            rescue_modes: self.rescue_modes.clone(),
++            rescue_match_rules: self.rescue_match_rules.clone(),
 +        })
++    }
++}
++
++fn match_title_regex_rules<'a>(
++    rules: &[RestoreMatchRule],
++    saved_app_id: Option<&String>,
++    toplevel_infos: &'a [ToplevelInfo],
++) -> Option<&'a ToplevelInfo> {
++    for rule in rules {
++        let re = match RegexBuilder::new(&rule.pattern)
++            .case_insensitive(true)
++            .build()
++        {
++            Ok(re) => re,
++            Err(err) => {
++                log::warn!(
++                    "restore: ignoring invalid title_regex rescue rule {:?}: {}",
++                    rule.pattern,
++                    err
++                );
++                continue;
++            }
++        };
++
++        for info in toplevel_infos {
++            if matches!(rule.scope, RestoreMatchScope::SameApp) {
++                let Some(app_id) = saved_app_id else {
++                    continue;
++                };
++                if app_id.is_empty() || info.app_id != *app_id {
++                    continue;
++                }
++            }
++
++            if re.is_match(&info.title) {
++                return Some(info);
++            }
++        }
      }
++    None
  }
- 
-@@ -86,10 +180,13 @@ impl From<PersistedCaptureSources> for RestoreData {
-     fn from(sources: PersistedCaptureSources) -> RestoreData {
-         RestoreData {
+@@ -88,3 +248,3 @@ impl From<PersistedCaptureSources> for RestoreData {
              vendor: "COSMIC".to_string(),
 -            version: 1,
-+            version: 2,
++            version: 3,
              data: zvariant::Value::from(zvariant::Structure::from((
-                 sources.outputs,
+@@ -92,2 +252,25 @@ impl From<PersistedCaptureSources> for RestoreData {
                  sources.toplevels,
 +                sources.toplevel_app_ids,
 +                sources.toplevel_titles,
 +                sources.rescue_modes,
++                sources
++                    .rescue_match_rules
++                    .iter()
++                    .map(|rules| {
++                        rules
++                            .iter()
++                            .map(|rule| rule.pattern.clone())
++                            .collect::<Vec<_>>()
++                    })
++                    .collect::<Vec<_>>(),
++                sources
++                    .rescue_match_rules
++                    .iter()
++                    .map(|rules| {
++                        rules
++                            .iter()
++                            .map(|rule| rule.scope.as_str().to_string())
++                            .collect::<Vec<_>>()
++                    })
++                    .collect::<Vec<_>>(),
              )))
-             .try_to_owned()
-             .unwrap(),
-@@ -100,12 +197,50 @@ impl From<PersistedCaptureSources> for RestoreData {
- impl TryFrom<&RestoreData> for PersistedCaptureSources {
-     type Error = ();
+@@ -102,8 +285,113 @@ impl TryFrom<&RestoreData> for PersistedCaptureSources {
      fn try_from(restore_data: &RestoreData) -> Result<Self, ()> {
 -        if (&*restore_data.vendor, restore_data.version) != ("COSMIC", 1) {
 +        if restore_data.vendor != "COSMIC" {
@@ -300,6 +326,7 @@ index b31f604..8d589d7 100644
 +                    toplevel_app_ids: vec![String::new(); tl_len],
 +                    toplevel_titles: vec![String::new(); tl_len],
 +                    rescue_modes: vec![RESCUE_MODE_EXACT; tl_len],
++                    rescue_match_rules: vec![Vec::new(); tl_len],
 +                    toplevels,
 +                })
 +            }
@@ -324,49 +351,101 @@ index b31f604..8d589d7 100644
 +                    toplevel_app_ids,
 +                    toplevel_titles,
 +                    rescue_modes,
++                    rescue_match_rules: vec![Vec::new(); tl_len],
++                })
++            }
++            3 => {
++                let (
++                    outputs,
++                    toplevels,
++                    toplevel_app_ids,
++                    toplevel_titles,
++                    rescue_modes,
++                    rescue_rule_patterns,
++                    rescue_rule_scopes,
++                ): (
++                    Vec<String>,
++                    Vec<String>,
++                    Vec<String>,
++                    Vec<String>,
++                    Vec<u32>,
++                    Vec<Vec<String>>,
++                    Vec<Vec<String>>,
++                ) = structure.try_into().map_err(|_| ())?;
++                let tl_len = toplevels.len();
++                if toplevel_app_ids.len() != tl_len
++                    || toplevel_titles.len() != tl_len
++                    || rescue_modes.len() != tl_len
++                    || rescue_rule_patterns.len() != tl_len
++                    || rescue_rule_scopes.len() != tl_len
++                {
++                    return Err(());
++                }
++
++                let mut rescue_match_rules = Vec::with_capacity(tl_len);
++                for (patterns, scopes) in rescue_rule_patterns
++                    .into_iter()
++                    .zip(rescue_rule_scopes.into_iter())
++                {
++                    let mut rules = Vec::new();
++                    for (pattern, scope) in patterns.into_iter().zip(scopes.into_iter()) {
++                        let Some(scope) = RestoreMatchScope::from_str(&scope) else {
++                            log::warn!(
++                                "restore: ignoring title_regex rule with invalid scope {:?}",
++                                scope
++                            );
++                            continue;
++                        };
++                        if let Err(err) = RegexBuilder::new(&pattern).case_insensitive(true).build()
++                        {
++                            log::warn!(
++                                "restore: ignoring malformed title_regex rule {:?}: {}",
++                                pattern,
++                                err
++                            );
++                            continue;
++                        }
++                        rules.push(RestoreMatchRule { pattern, scope });
++                    }
++                    rescue_match_rules.push(rules);
++                }
++
++                Ok(PersistedCaptureSources {
++                    outputs,
++                    toplevels,
++                    toplevel_app_ids,
++                    toplevel_titles,
++                    rescue_modes,
++                    rescue_match_rules,
 +                })
 +            }
 +            _ => Err(()),
 +        }
      }
- }
- 
-@@ -122,6 +257,15 @@ struct SelectSourcesOptions {
-     restore_data: Option<RestoreData>,
-     // Default: 0
+@@ -124,2 +412,12 @@ struct SelectSourcesOptions {
      persist_mode: Option<u32>,
 +    source_label: Option<String>,
 +    restore_policy: Option<HashMap<String, zvariant::OwnedValue>>,
- }
- 
++    restore_match_rules: Option<Vec<HashMap<String, zvariant::OwnedValue>>>,
++}
++
 +#[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
 +struct RestoreFailureResult {
 +    reason: String,
 +    action: u32,
 +    token_invalid: bool,
-+}
-+
- #[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
-@@ -140,6 +277,7 @@ struct StartResult {
-     streams: Vec<(u32, StreamProps)>,
-     persist_mode: Option<u32>,
+ }
+@@ -142,2 +440,3 @@ struct StartResult {
      restore_data: Option<RestoreData>,
 +    restore_failure: Option<RestoreFailureResult>,
  }
- 
- #[derive(Default)]
-@@ -149,6 +287,8 @@ struct SessionData {
-     multiple: bool,
-     source_types: BitFlags<SourceType>,
+@@ -151,2 +450,5 @@ struct SessionData {
      persisted_capture_sources: Option<PersistedCaptureSources>,
 +    source_label: Option<String>,
 +    source_unavailable_action: u32,
++    restore_match_rules: Vec<RestoreMatchRule>,
      closed: bool,
- }
- 
-@@ -161,6 +301,63 @@ impl SessionData {
-     }
- }
+@@ -163,2 +465,100 @@ impl SessionData {
  
 +/// Sanitize a user-provided label per the ScreenCast v6 spec:
 +/// strip control characters, truncate to 256 bytes, normalize empty to None.
@@ -425,22 +504,57 @@ index b31f604..8d589d7 100644
 +    }
 +}
 +
++fn owned_value_string(value: &zvariant::OwnedValue) -> Option<String> {
++    value.clone().try_into().ok()
++}
++
++fn parse_restore_match_rules(
++    rules: Option<Vec<HashMap<String, zvariant::OwnedValue>>>,
++) -> Vec<RestoreMatchRule> {
++    let mut parsed = Vec::new();
++    for rule in rules.unwrap_or_default() {
++        let kind = rule.get("kind").and_then(owned_value_string);
++        if kind.as_deref() != Some("title_regex") {
++            continue;
++        }
++
++        let Some(pattern) = rule.get("pattern").and_then(owned_value_string) else {
++            continue;
++        };
++        if pattern.trim().is_empty() {
++            continue;
++        }
++
++        let scope = rule
++            .get("scope")
++            .and_then(owned_value_string)
++            .and_then(|scope| RestoreMatchScope::from_str(&scope))
++            .unwrap_or(RestoreMatchScope::SameApp);
++
++        if let Err(err) = RegexBuilder::new(&pattern).case_insensitive(true).build() {
++            log::warn!(
++                "restore: ignoring invalid external title_regex rule {:?}: {}",
++                pattern,
++                err
++            );
++            continue;
++        }
++
++        parsed.push(RestoreMatchRule { pattern, scope });
++    }
++    parsed
++}
++
  pub struct ScreenCast {
-     wayland_helper: WaylandHelper,
-     tx: Sender<subscription::Event>,
-@@ -223,6 +390,9 @@ impl ScreenCast {
-                         log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
-                     }
+@@ -225,2 +625,7 @@ impl ScreenCast {
                  }
 +                session_data.source_label = sanitize_label(options.source_label);
 +                session_data.source_unavailable_action =
 +                    restore_policy_action(&options.restore_policy, "source_unavailable");
++                session_data.restore_match_rules =
++                    parse_restore_match_rules(options.restore_match_rules);
                  PortalResponse::Success(HashMap::new())
-             }
-             None => PortalResponse::Other,
-@@ -246,17 +418,28 @@ impl ScreenCast {
-                 return PortalResponse::Other;
-             };
+@@ -248,3 +653,11 @@ impl ScreenCast {
  
 -            let (cursor_mode, multiple, source_types, persisted_capture_sources) = {
 +            let (
@@ -450,27 +564,22 @@ index b31f604..8d589d7 100644
 +                persisted_capture_sources,
 +                source_label,
 +                source_unavailable_action,
++                restore_match_rules,
 +            ) = {
                  let session_data = interface.get_mut().await;
-                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_HIDDEN);
-                 let multiple = session_data.multiple;
-                 let source_types = session_data.source_types;
+@@ -254,2 +667,5 @@ impl ScreenCast {
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
 +                let source_label = session_data.source_label.clone();
 +                let source_unavailable_action = session_data.source_unavailable_action;
++                let restore_match_rules = session_data.restore_match_rules.clone();
                  (
-                     cursor_mode,
-                     multiple,
-                     source_types,
+@@ -259,2 +675,5 @@ impl ScreenCast {
                      persisted_capture_sources,
 +                    source_label,
 +                    source_unavailable_action,
++                    restore_match_rules,
                  )
-             };
- 
-@@ -268,11 +451,77 @@ impl ScreenCast {
-             }
- 
+@@ -270,7 +689,73 @@ impl ScreenCast {
              let capture_sources = if let Some(capture_sources) =
 -                persisted_capture_sources.and_then(|x| x.to_capture_sources(&self.wayland_helper))
 +                persisted_capture_sources
@@ -546,11 +655,14 @@ index b31f604..8d589d7 100644
 -                // Show dialog to prompt for what to capture
 +                // No restore data: show picker dialog
                  let resp = screencast_dialog::show_screencast_prompt(
-                     &self.tx,
-                     &session_handle,
-@@ -372,15 +618,27 @@ impl ScreenCast {
-                 .collect();
-             interface.get_mut().await.screencast_threads = screencast_threads;
+@@ -281,4 +766,4 @@ impl ScreenCast {
+                     source_types,
+-                    &self.wayland_helper,
+-                )
++                            &self.wayland_helper,
++                        )
+                 .await;
+@@ -374,2 +859,12 @@ impl ScreenCast {
  
 +            // Use rescue modes from the dialog selection if available,
 +            // otherwise from existing persisted data, otherwise default
@@ -563,111 +675,160 @@ index b31f604..8d589d7 100644
 +                    .unwrap_or_default()
 +            };
              let persisted_capture_sources = PersistedCaptureSources::from_capture_sources(
-                 &self.wayland_helper,
+@@ -377,2 +872,4 @@ impl ScreenCast {
                  &capture_sources,
 +                &rescue_modes,
++                &restore_match_rules,
              );
- 
-             PortalResponse::Success(StartResult {
-                 streams,
-                 persist_mode: None,
+@@ -383,2 +880,3 @@ impl ScreenCast {
                  restore_data: persisted_capture_sources.map(|x| x.into()),
 +                restore_failure: None,
              })
-         })
-         .await
-@@ -399,6 +657,6 @@ impl ScreenCast {
- 
-     #[zbus(property, name = "version")]
+@@ -401,3 +899,3 @@ impl ScreenCast {
      async fn version(&self) -> u32 {
 -        4
 +        6
      }
- }
 diff --git a/src/screencast_dialog.rs b/src/screencast_dialog.rs
-index 22c33f1..f6399bf 100644
+index 22c33f1..c33b3a2 100644
 --- a/src/screencast_dialog.rs
 +++ b/src/screencast_dialog.rs
-@@ -22,6 +22,7 @@ use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
- use freedesktop_desktop_entry as fde;
- use freedesktop_desktop_entry::unicase::Ascii;
+@@ -2,2 +2,3 @@ use crate::app::CosmicPortal;
+ use crate::fl;
++use crate::screencast::{RESCUE_MODE_APP, RESCUE_MODE_EXACT, RESCUE_MODE_TITLE};
+ use crate::wayland::{CaptureSource, WaylandHelper};
+@@ -18,2 +19,3 @@ use cosmic::iced_winit::commands::layer_surface::{
+ use cosmic::widget::autosize;
++use cosmic::iced::widget::text_editor;
+ use cosmic::{theme, widget};
+@@ -24,2 +26,4 @@ use freedesktop_desktop_entry::unicase::Ascii;
  use freedesktop_desktop_entry::{DesktopEntry, get_languages_from_env};
++use regex::RegexBuilder;
 +use std::collections::HashMap;
  use std::mem;
- use std::sync::LazyLock;
- use tokio::sync::mpsc;
-@@ -94,6 +95,7 @@ pub async fn show_screencast_prompt(
-         app_name,
-         tx,
+@@ -96,2 +100,4 @@ pub async fn show_screencast_prompt(
          capture_sources: Default::default(),
 +        rescue_mode_selections: HashMap::new(),
++        rescue_alias_editors: HashMap::new(),
      };
-     subscription_tx
-         .send(crate::subscription::Event::Screencast(args))
-@@ -146,6 +148,8 @@ pub struct Args {
-     // Should be oneshot, but need `Clone` bound
-     tx: mpsc::Sender<Option<CaptureSources>>,
+@@ -137,3 +143,3 @@ enum Tab {
+ 
+-#[derive(Debug, Clone)]
++#[derive(Debug)]
+ pub struct Args {
+@@ -148,2 +154,28 @@ pub struct Args {
      capture_sources: CaptureSources,
 +    /// Per-toplevel rescue mode selection (keyed by toplevel handle).
 +    rescue_mode_selections: HashMap<ExtForeignToplevelHandleV1, u32>,
++    rescue_alias_editors: HashMap<ExtForeignToplevelHandleV1, text_editor::Content>,
++}
++
++impl Clone for Args {
++    fn clone(&self) -> Self {
++        Self {
++            session_handle: self.session_handle.clone(),
++            multiple: self.multiple,
++            source_types: self.source_types,
++            outputs: self.outputs.clone(),
++            toplevels: self.toplevels.clone(),
++            app_name: self.app_name.clone(),
++            tx: self.tx.clone(),
++            capture_sources: self.capture_sources.clone(),
++            rescue_mode_selections: self.rescue_mode_selections.clone(),
++            rescue_alias_editors: self
++                .rescue_alias_editors
++                .iter()
++                .map(|(handle, content)| {
++                    (handle.clone(), text_editor::Content::with_text(&content.text()))
++                })
++                .collect(),
++        }
++    }
  }
+@@ -160,2 +192,31 @@ impl Args {
  
- impl Args {
-@@ -158,11 +162,18 @@ impl Args {
-     }
- }
- 
-+/// Rescue mode: how the portal matches windows after app restart.
-+pub const RESCUE_MODE_EXACT: u32 = 0;
-+pub const RESCUE_MODE_APP: u32 = 1;
-+pub const RESCUE_MODE_TITLE: u32 = 2;
++#[derive(Clone, Debug)]
++pub struct RestoreMatchRule {
++    pub pattern: String,
++    pub scope: RestoreMatchScope,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RestoreMatchScope {
++    SameApp,
++    AnyApp,
++}
++
++impl RestoreMatchScope {
++    pub fn as_str(self) -> &'static str {
++        match self {
++            RestoreMatchScope::SameApp => "same_app",
++            RestoreMatchScope::AnyApp => "any_app",
++        }
++    }
++
++    pub fn from_str(scope: &str) -> Option<Self> {
++        match scope {
++            "same_app" | "same" => Some(Self::SameApp),
++            "any_app" | "any" => Some(Self::AnyApp),
++            _ => None,
++        }
++    }
++}
 +
  // TODO order?
- #[derive(Clone, Debug, Default)]
- pub struct CaptureSources {
-     pub outputs: Vec<WlOutput>,
+@@ -165,2 +226,6 @@ pub struct CaptureSources {
      pub toplevels: Vec<ExtForeignToplevelHandleV1>,
 +    /// Per-toplevel rescue mode (parallel with `toplevels`).
 +    pub rescue_modes: Vec<u32>,
++    /// Per-toplevel title regex rescue rules (parallel with `toplevels`).
++    pub rescue_match_rules: Vec<Vec<RestoreMatchRule>>,
  }
- 
- impl CaptureSources {
-@@ -173,6 +184,7 @@ impl CaptureSources {
-     pub fn clear(&mut self) {
-         self.outputs.clear();
+@@ -175,2 +240,4 @@ impl CaptureSources {
          self.toplevels.clear();
 +        self.rescue_modes.clear();
++        self.rescue_match_rules.clear();
      }
- }
- 
-@@ -181,6 +193,7 @@ pub enum Msg {
-     ActivateTab(widget::segmented_button::Entity),
-     SelectOutput(WlOutput),
+@@ -183,2 +250,4 @@ pub enum Msg {
      SelectToplevel(ExtForeignToplevelHandleV1),
 +    SetRescueMode(ExtForeignToplevelHandleV1, u32),
++    EditRescueAliases(ExtForeignToplevelHandleV1, text_editor::Action),
      Share,
-     Cancel,
- }
-@@ -221,11 +234,36 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
-                 .position(|t| t == &toplevel)
-             {
+@@ -223,2 +292,5 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
                  args.capture_sources.toplevels.remove(idx);
 +                args.capture_sources.rescue_modes.remove(idx);
++                args.capture_sources.rescue_match_rules.remove(idx);
 +                args.rescue_mode_selections.remove(&toplevel);
              } else {
-                 if !args.multiple && !args.capture_sources.is_empty() {
+@@ -226,7 +298,56 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
                      args.capture_sources.clear();
 +                    args.rescue_mode_selections.clear();
                  }
++                let suggested_aliases = args
++                    .toplevels
++                    .iter()
++                    .find(|(info, _)| info.foreign_toplevel == toplevel)
++                    .and_then(|(info, _)| suggest_project_aliases(info))
++                    .unwrap_or_default();
++                args.rescue_alias_editors
++                    .entry(toplevel.clone())
++                    .or_insert_with(|| text_editor::Content::with_text(&suggested_aliases));
 +                let mode = args
 +                    .rescue_mode_selections
 +                    .get(&toplevel)
 +                    .copied()
-+                    .unwrap_or(RESCUE_MODE_APP);
++                    .unwrap_or_else(|| {
++                        if suggested_aliases.is_empty() {
++                            RESCUE_MODE_APP
++                        } else {
++                            RESCUE_MODE_TITLE
++                        }
++                    });
 +                args.rescue_mode_selections
 +                    .insert(toplevel.clone(), mode);
                  args.capture_sources.toplevels.push(toplevel);
 +                args.capture_sources.rescue_modes.push(mode);
++                args.capture_sources.rescue_match_rules.push(Vec::new());
 +            }
 +        }
 +        Msg::SetRescueMode(toplevel, mode) => {
@@ -684,10 +845,107 @@ index 22c33f1..f6399bf 100644
 +                }
              }
          }
++        Msg::EditRescueAliases(toplevel, action) => {
++            args.rescue_alias_editors
++                .entry(toplevel)
++                .or_default()
++                .perform(action);
++        }
          Msg::Share => {
-@@ -356,12 +394,15 @@ fn output_button<'a>(
-         .into()
- }
++            sync_capture_aliases(args);
++            if args.capture_sources.is_empty() || has_invalid_aliases(args) {
++                return cosmic::Task::none();
++            }
+             if let Some(mut args) = portal.screencast_args.take() {
+@@ -247,2 +368,87 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+ 
++fn sync_capture_aliases(args: &mut Args) {
++    args.capture_sources.rescue_match_rules.clear();
++    for toplevel in &args.capture_sources.toplevels {
++        let rules = args
++            .rescue_alias_editors
++            .get(toplevel)
++            .map(|content| parse_alias_text(&content.text()).unwrap_or_default())
++            .unwrap_or_default();
++        args.capture_sources.rescue_match_rules.push(rules);
++    }
++}
++
++fn has_invalid_aliases(args: &Args) -> bool {
++    args.capture_sources.toplevels.iter().any(|toplevel| {
++        args.rescue_alias_editors
++            .get(toplevel)
++            .is_some_and(|content| parse_alias_text(&content.text()).is_err())
++    })
++}
++
++pub fn parse_alias_text(text: &str) -> Result<Vec<RestoreMatchRule>, String> {
++    let mut rules = Vec::new();
++    for (line_idx, line) in text.lines().enumerate() {
++        let line = line.trim();
++        if line.is_empty() {
++            continue;
++        }
++
++        let (scope, pattern) = if let Some(pattern) = line.strip_prefix("any_app:") {
++            (RestoreMatchScope::AnyApp, pattern.trim())
++        } else if let Some(pattern) = line.strip_prefix("any:") {
++            (RestoreMatchScope::AnyApp, pattern.trim())
++        } else if let Some(pattern) = line.strip_prefix("same_app:") {
++            (RestoreMatchScope::SameApp, pattern.trim())
++        } else if let Some(pattern) = line.strip_prefix("same:") {
++            (RestoreMatchScope::SameApp, pattern.trim())
++        } else {
++            (RestoreMatchScope::SameApp, line)
++        };
++
++        if pattern.is_empty() {
++            continue;
++        }
++        RegexBuilder::new(pattern)
++            .case_insensitive(true)
++            .build()
++            .map_err(|err| format!("line {}: {}", line_idx + 1, err))?;
++        rules.push(RestoreMatchRule {
++            pattern: pattern.to_string(),
++            scope,
++        });
++    }
++    Ok(rules)
++}
++
++fn suggest_project_aliases(info: &ToplevelInfo) -> Option<String> {
++    if !is_vscode_like(&info.app_id) {
++        return None;
++    }
++
++    let suffixes = [
++        " - Visual Studio Code",
++        " - Code",
++        " - VSCodium",
++        " - Codium",
++    ];
++    let title = suffixes
++        .iter()
++        .find_map(|suffix| info.title.strip_suffix(suffix))
++        .unwrap_or(&info.title);
++    let project = title
++        .rsplit(" - ")
++        .next()
++        .map(str::trim)
++        .filter(|s| !s.is_empty())?;
++    Some(regex::escape(project))
++}
++
++fn is_vscode_like(app_id: &str) -> bool {
++    let app_id = app_id.to_ascii_lowercase();
++    app_id.contains("code")
++        || app_id.contains("codium")
++        || app_id.contains("vscode")
++}
++
+ pub fn update_args(portal: &mut CosmicPortal, args: Args) -> cosmic::Task<crate::app::Msg> {
+@@ -358,8 +564,13 @@ fn output_button<'a>(
  
 -fn toplevel_button(
 -    label: &str,
@@ -696,6 +954,8 @@ index 22c33f1..f6399bf 100644
      is_selected: bool,
 +    has_app_id: bool,
 +    rescue_mode: u32,
++    alias_content: Option<&'a text_editor::Content>,
++    aliases_invalid: bool,
      icon: IconSource,
 -    msg: Msg,
 -) -> cosmic::Element<'_, Msg> {
@@ -703,11 +963,7 @@ index 22c33f1..f6399bf 100644
 +    toplevel: &ExtForeignToplevelHandleV1,
 +) -> cosmic::Element<'a, Msg> {
      let text = widget::text(label).class(theme::style::Text::Custom(|theme| {
-         let container = theme.current_container();
-         cosmic::iced_core::widget::text::Style {
-@@ -371,19 +412,55 @@ fn toplevel_button(
-     let button = widget::button::custom(text)
-         .width(iced::Length::Fill)
+@@ -373,7 +584,5 @@ fn toplevel_button(
          .padding(0)
 -        // TODO hover style? Etc.
 -        // .style(theme::style::Button::Text)
@@ -716,11 +972,11 @@ index 22c33f1..f6399bf 100644
 -        .on_press(msg);
 +        .on_press(select_msg);
      let mut children = Vec::new();
-     children.push(icon.as_cosmic_icon().icon().size(24).into());
+@@ -381,3 +590,2 @@ fn toplevel_button(
      children.push(button.into());
 -    // TODO
      if is_selected {
-         children.push(widget::text("✓").into());
+@@ -385,3 +593,56 @@ fn toplevel_button(
      }
 -    widget::row::with_children(children).spacing(12).into()
 +    let row = widget::row::with_children(children).spacing(12);
@@ -733,6 +989,7 @@ index 22c33f1..f6399bf 100644
 +    let tl = toplevel.clone();
 +    let tl2 = toplevel.clone();
 +    let tl3 = toplevel.clone();
++    let tl4 = toplevel.clone();
 +
 +    let exact_radio = widget::radio(
 +        widget::text(fl!("rescue-exact")),
@@ -759,16 +1016,30 @@ index 22c33f1..f6399bf 100644
 +        radio_children.push(title_radio.into());
 +    }
 +    let radios = widget::row::with_children(radio_children).spacing(16);
++    let mut details: Vec<cosmic::Element<'_, Msg>> = vec![row.into(), radios.into()];
 +
-+    widget::column::with_children(vec![row.into(), radios.into()])
++    if let Some(alias_content) = alias_content {
++        let editor = widget::text_editor(alias_content)
++            .placeholder(fl!("rescue-aliases-placeholder"))
++            .height(72.0)
++            .on_action(move |action| Msg::EditRescueAliases(tl4.clone(), action));
++        details.push(widget::text(fl!("rescue-aliases")).into());
++        details.push(editor.into());
++        if aliases_invalid {
++            details.push(widget::text(fl!("rescue-invalid-regex")).into());
++        }
++    }
++
++    widget::column::with_children(details)
 +        .spacing(4)
 +        .into()
  }
- 
- pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
-@@ -422,15 +499,22 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
-             for (toplevel_info, icon) in &args.toplevels {
-                 let icon = IconSource::from_unknown(icon.as_deref().unwrap_or_default());
+@@ -397,3 +658,3 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+         widget::button::standard(fl!("share")).class(cosmic::style::Button::Suggested);
+-    if !args.capture_sources.is_empty() {
++    if !args.capture_sources.is_empty() && !has_invalid_aliases(args) {
+         share_button = share_button.on_press(Msg::Share);
+@@ -424,6 +685,13 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
                  let label = &toplevel_info.title;
 -                let is_selected = args
 -                    .capture_sources
@@ -782,35 +1053,32 @@ index 22c33f1..f6399bf 100644
 +                    .get(handle)
 +                    .copied()
 +                    .unwrap_or(RESCUE_MODE_APP);
++                let alias_content = args.rescue_alias_editors.get(handle);
++                let aliases_invalid = alias_content
++                    .is_some_and(|content| parse_alias_text(&content.text()).is_err());
                  list = list.add(toplevel_button(
-                     label,
+@@ -431,4 +699,9 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
                      is_selected,
 +                    has_app_id,
 +                    rescue_mode,
++                    alias_content,
++                    aliases_invalid,
                      icon,
 -                    Msg::SelectToplevel(toplevel_info.foreign_toplevel.clone()),
 +                    Msg::SelectToplevel(handle.clone()),
 +                    handle,
                  ));
-             }
-             if args.toplevels.len() > 8 {
 diff --git a/src/wayland/mod.rs b/src/wayland/mod.rs
 index 15a9536..02f3509 100644
 --- a/src/wayland/mod.rs
 +++ b/src/wayland/mod.rs
-@@ -24,6 +24,9 @@ use std::{
-     sync::{Arc, Condvar, Mutex, Weak},
-     thread,
+@@ -26,2 +26,5 @@ use std::{
  };
 +
 +use crate::screencast_dialog::CaptureSources;
 +use crate::screencast::PersistedCaptureSources;
  use wayland_client::{
-     Connection, Dispatch, QueueHandle, WEnum,
-     globals::registry_queue_init,
-@@ -81,12 +84,21 @@ impl DmabufHelper {
-     }
- }
+@@ -83,2 +86,10 @@ impl DmabufHelper {
  
 +const MAX_PENDING_RESCUES: usize = 64;
 +
@@ -821,18 +1089,11 @@ index 15a9536..02f3509 100644
 +}
 +
  struct WaylandHelperInner {
-     conn: wayland_client::Connection,
-     outputs: Mutex<Vec<wl_output::WlOutput>>,
-     output_infos: Mutex<HashMap<wl_output::WlOutput, OutputInfo>>,
-     output_toplevels: Mutex<HashMap<wl_output::WlOutput, Vec<ExtForeignToplevelHandleV1>>>,
+@@ -89,2 +100,3 @@ struct WaylandHelperInner {
      toplevels: Mutex<Vec<ToplevelInfo>>,
 +    pending_rescues: Mutex<Vec<PendingRescue>>,
      qh: QueueHandle<AppData>,
-     capturer: Capturer,
-     wl_shm: wl_shm::WlShm,
-@@ -152,6 +164,26 @@ impl AppData {
- 
-         *self.wayland_helper.inner.toplevels.lock().unwrap() =
+@@ -154,2 +166,22 @@ impl AppData {
              self.toplevel_info_state.toplevels().cloned().collect();
 +
 +        // Check all pending rescues against current toplevels.
@@ -855,19 +1116,11 @@ index 15a9536..02f3509 100644
 +            rescues.push(rescue);
 +        }
      }
- }
- 
-@@ -245,6 +277,7 @@ impl WaylandHelper {
-                 output_infos: Mutex::new(HashMap::new()),
-                 output_toplevels: Mutex::new(HashMap::new()),
+@@ -247,2 +279,3 @@ impl WaylandHelper {
                  toplevels: Mutex::new(Vec::new()),
 +                pending_rescues: Mutex::new(Vec::new()),
                  qh: qh.clone(),
-                 capturer: screencopy_state.capturer().clone(),
-                 wl_shm: shm_state.wl_shm().clone(),
-@@ -292,6 +325,37 @@ impl WaylandHelper {
-         self.inner.toplevels.lock().unwrap().clone()
-     }
+@@ -294,2 +327,33 @@ impl WaylandHelper {
  
 +    /// Atomically check if persisted sources can be resolved against current
 +    /// toplevels. If not, register a rescue hook in the same lock scope.
@@ -901,7 +1154,6 @@ index 15a9536..02f3509 100644
 +    }
 +
      pub fn output_info(&self, output: &wl_output::WlOutput) -> Option<OutputInfo> {
-         self.inner.output_infos.lock().unwrap().get(output).cloned()
-     }
 -- 
 2.53.0
+

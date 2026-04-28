@@ -1,18 +1,18 @@
-From ba73d2ed9b7fe45135194fafd442d4faafbb45b2 Mon Sep 17 00:00:00 2001
+From 2439811422a8a95b39195298645aeceec4616872 Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Thu, 23 Apr 2026 10:46:51 +0200
-Subject: [PATCH] linux-pipewire: send source_label and restore_policy
+Subject: [PATCH] linux-pipewire: send restore match rules
 
 ---
- plugins/linux-pipewire/data/locale/en-US.ini |  4 ++
- plugins/linux-pipewire/screencast-portal.c   | 64 +++++++++++++++++++-
- 2 files changed, 66 insertions(+), 2 deletions(-)
+ plugins/linux-pipewire/data/locale/en-US.ini |   5 +
+ plugins/linux-pipewire/screencast-portal.c   | 128 ++++++++++++++++++-
+ 2 files changed, 131 insertions(+), 2 deletions(-)
 
 diff --git a/plugins/linux-pipewire/data/locale/en-US.ini b/plugins/linux-pipewire/data/locale/en-US.ini
-index a7eedd1..2c2908a 100644
+index a7eedd1..a56fdb5 100644
 --- a/plugins/linux-pipewire/data/locale/en-US.ini
 +++ b/plugins/linux-pipewire/data/locale/en-US.ini
-@@ -8,4 +8,8 @@ PipeWireSelectWindow="Select Window"
+@@ -8,4 +8,9 @@ PipeWireSelectWindow="Select Window"
  PipeWireWindowCapture="Window Capture (PipeWire)"
  PipeWireSelectScreenCast="Open Selector"
  ShowCursor="Show Cursor"
@@ -20,23 +20,84 @@ index a7eedd1..2c2908a 100644
 +RestorePolicyAction.Prompt="Prompt user"
 +RestorePolicyAction.Skip="Skip silently"
 +RestorePolicyAction.Error="Report error"
++RestoreMatchRules="Restore title aliases (regex, one per line)"
  VideoFormat="Video Format"
 diff --git a/plugins/linux-pipewire/screencast-portal.c b/plugins/linux-pipewire/screencast-portal.c
-index d5fe531..4f02f55 100644
+index d5fe531..5b69736 100644
 --- a/plugins/linux-pipewire/screencast-portal.c
 +++ b/plugins/linux-pipewire/screencast-portal.c
-@@ -57,6 +57,7 @@ struct screencast_portal_capture {
+@@ -22,6 +22,7 @@
+ #include "portal.h"
+ 
+ #include <gio/gunixfdlist.h>
++#include <string.h>
+ 
+ enum portal_capture_type {
+ 	PORTAL_CAPTURE_TYPE_MONITOR = 1 << 0,
+@@ -57,6 +58,8 @@ struct screencast_portal_capture {
  
  	obs_pipewire *obs_pw;
  	obs_pipewire_stream *obs_pw_stream;
 +	uint32_t restore_action;
++	char *restore_match_rules;
  };
  
  /* ------------------------------------------------- */
-@@ -211,6 +212,29 @@ static void open_pipewire_remote(struct screencast_portal_capture *capture)
+@@ -211,6 +214,80 @@ static void open_pipewire_remote(struct screencast_portal_capture *capture)
  
  /* ------------------------------------------------- */
  
++static void add_restore_match_rules(GVariantBuilder *builder, const char *text)
++{
++	if (!text || !*text)
++		return;
++
++	GVariantBuilder rules;
++	g_variant_builder_init(&rules, G_VARIANT_TYPE("aa{sv}"));
++
++	bool added = false;
++	gchar **lines = g_strsplit(text, "\n", -1);
++	for (char **line_ptr = lines; line_ptr && *line_ptr; line_ptr++) {
++		char *line = g_strstrip(*line_ptr);
++		if (!*line)
++			continue;
++
++		const char *scope = "same_app";
++		const char *pattern = line;
++		if (g_str_has_prefix(pattern, "any_app:")) {
++			scope = "any_app";
++			pattern += strlen("any_app:");
++		} else if (g_str_has_prefix(pattern, "any:")) {
++			scope = "any_app";
++			pattern += strlen("any:");
++		} else if (g_str_has_prefix(pattern, "same_app:")) {
++			scope = "same_app";
++			pattern += strlen("same_app:");
++		} else if (g_str_has_prefix(pattern, "same:")) {
++			scope = "same_app";
++			pattern += strlen("same:");
++		}
++
++		pattern = g_strstrip((char *)pattern);
++		if (!*pattern)
++			continue;
++
++		GVariantBuilder rule;
++		g_variant_builder_init(&rule, G_VARIANT_TYPE_VARDICT);
++		g_variant_builder_add(&rule, "{sv}", "kind", g_variant_new_string("title_regex"));
++		g_variant_builder_add(&rule, "{sv}", "pattern", g_variant_new_string(pattern));
++		g_variant_builder_add(&rule, "{sv}", "scope", g_variant_new_string(scope));
++		g_variant_builder_add_value(&rules, g_variant_builder_end(&rule));
++		added = true;
++	}
++	g_strfreev(lines);
++
++	if (added)
++		g_variant_builder_add(builder, "{sv}", "restore_match_rules", g_variant_builder_end(&rules));
++	else
++		g_variant_builder_clear(&rules);
++}
++
 +static bool handle_restore_failure(struct screencast_portal_capture *capture, GVariant *result, const char *phase)
 +{
 +	GVariant *restore_failure = g_variant_lookup_value(result, "restore_failure", G_VARIANT_TYPE_VARDICT);
@@ -63,7 +124,7 @@ index d5fe531..4f02f55 100644
  static void on_start_response_received_cb(GVariant *parameters, void *user_data)
  {
  	struct screencast_portal_capture *capture = user_data;
-@@ -224,7 +248,8 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
+@@ -224,7 +301,8 @@ static void on_start_response_received_cb(GVariant *parameters, void *user_data)
  	g_variant_get(parameters, "(u@a{sv})", &response, &result);
  
  	if (response != 0) {
@@ -73,7 +134,7 @@ index d5fe531..4f02f55 100644
  		return;
  	}
  
-@@ -320,7 +345,8 @@ static void on_select_source_response_received_cb(GVariant *parameters, void *us
+@@ -320,7 +398,8 @@ static void on_select_source_response_received_cb(GVariant *parameters, void *us
  	g_variant_get(parameters, "(u@a{sv})", &response, &ret);
  
  	if (response != 0) {
@@ -83,7 +144,7 @@ index d5fe531..4f02f55 100644
  		return;
  	}
  
-@@ -377,6 +403,22 @@ static void select_source(struct screencast_portal_capture *capture)
+@@ -377,6 +456,24 @@ static void select_source(struct screencast_portal_capture *capture)
  		}
  	}
  
@@ -101,50 +162,64 @@ index d5fe531..4f02f55 100644
 +			g_variant_builder_add(&builder, "{sv}", "restore_policy",
 +					      g_variant_builder_end(&policy));
 +		}
++
++		add_restore_match_rules(&builder, capture->restore_match_rules);
 +	}
 +
  	g_dbus_proxy_call(get_screencast_portal_proxy(), "SelectSources",
  			  g_variant_new("(oa{sv})", capture->session_handle, &builder), G_DBUS_CALL_FLAGS_NONE, -1,
  			  capture->cancellable, on_source_selected_cb, NULL);
-@@ -517,6 +559,9 @@ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_
+@@ -517,6 +614,10 @@ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_
  	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_MONITOR;
  	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
  	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
 +	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
 +					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
 +					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
++	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  	capture->source = source;
  
  	init_screencast_capture(capture);
-@@ -531,6 +576,9 @@ static void *screencast_portal_window_capture_create(obs_data_t *settings, obs_s
+@@ -531,6 +632,10 @@ static void *screencast_portal_window_capture_create(obs_data_t *settings, obs_s
  	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_WINDOW;
  	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
  	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
 +	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
 +					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
 +					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
++	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  	capture->source = source;
  
  	init_screencast_capture(capture);
-@@ -546,6 +594,9 @@ static void *screencast_portal_capture_create(obs_data_t *settings, obs_source_t
+@@ -546,6 +651,10 @@ static void *screencast_portal_capture_create(obs_data_t *settings, obs_source_t
  	capture->capture_type = OBS_PORTAL_CAPTURE_TYPE_UNIFIED;
  	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
  	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
 +	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
 +					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
 +					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
++	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  	capture->source = source;
  
  	init_screencast_capture(capture);
-@@ -588,6 +639,7 @@ static void screencast_portal_capture_get_defaults(obs_data_t *settings)
+@@ -569,6 +678,7 @@ static void screencast_portal_capture_destroy(void *data)
+ 	}
+ 
+ 	g_clear_pointer(&capture->restore_token, bfree);
++	g_clear_pointer(&capture->restore_match_rules, bfree);
+ 
+ 	g_clear_pointer(&capture->obs_pw_stream, obs_pipewire_stream_destroy);
+ 	obs_pipewire_destroy(capture->obs_pw);
+@@ -588,6 +698,8 @@ static void screencast_portal_capture_get_defaults(obs_data_t *settings)
  {
  	obs_data_set_default_bool(settings, "ShowCursor", true);
  	obs_data_set_default_string(settings, "RestoreToken", NULL);
 +	obs_data_set_default_int(settings, "RestorePolicyAction", 1);
++	obs_data_set_default_string(settings, "RestoreMatchRules", NULL);
  }
  
  static obs_properties_t *screencast_portal_capture_get_properties(void *data)
-@@ -614,6 +666,13 @@ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
+@@ -614,6 +726,15 @@ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
  	obs_properties_add_button2(properties, "Reload", obs_module_text(reload_string_id), reload_session_cb, capture);
  	obs_properties_add_bool(properties, "ShowCursor", obs_module_text("ShowCursor"));
  
@@ -154,15 +229,19 @@ index d5fe531..4f02f55 100644
 +	obs_property_list_add_int(mode_prop, obs_module_text("RestorePolicyAction.Prompt"), 0);
 +	obs_property_list_add_int(mode_prop, obs_module_text("RestorePolicyAction.Skip"), 1);
 +	obs_property_list_add_int(mode_prop, obs_module_text("RestorePolicyAction.Error"), 2);
++	obs_properties_add_text(properties, "RestoreMatchRules", obs_module_text("RestoreMatchRules"),
++				OBS_TEXT_MULTILINE);
 +
  	return properties;
  }
  
-@@ -622,6 +681,7 @@ static void screencast_portal_capture_update(void *data, obs_data_t *settings)
+@@ -622,6 +743,9 @@ static void screencast_portal_capture_update(void *data, obs_data_t *settings)
  	struct screencast_portal_capture *capture = data;
  
  	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
 +	capture->restore_action = (uint32_t)obs_data_get_int(settings, "RestorePolicyAction");
++	g_clear_pointer(&capture->restore_match_rules, bfree);
++	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  
  	if (capture->obs_pw_stream)
  		obs_pipewire_stream_set_cursor_visible(capture->obs_pw_stream, capture->cursor_visible);
