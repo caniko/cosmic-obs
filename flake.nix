@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs-atlas.url = "github:NixOS/nixpkgs/0726a0ecb6d4e08f6adced58726b95db924cef57";
     flake-parts.url = "github:hercules-ci/flake-parts";
     crane.url = "github:ipetkov/crane";
     fenix = {
@@ -135,6 +136,9 @@
           ];
         };
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        atlasPkgs = import inputs.nixpkgs-atlas {
+          inherit system;
+        };
       in {
         treefmt.config = {
           projectRootFile = "flake.nix";
@@ -170,6 +174,8 @@
           libportal-patch-applies = import ./nix/libportal.nix {inherit pkgs;};
           xdph-patch-applies = import ./nix/xdph.nix {inherit pkgs;};
           cosmic-patch-applies = import ./nix/xdg-desktop-portal-cosmic.nix {inherit pkgs;};
+          cosmic-patch-applies-atlas = import ./nix/xdg-desktop-portal-cosmic.nix {pkgs = atlasPkgs;};
+          obs-patch-applies = import ./nix/obs-studio.nix {inherit pkgs;};
         };
 
         devShells.default = craneLib.devShell {
