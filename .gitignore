@@ -1,3 +1,4 @@
 .tmp/
+.cargo/config.toml
 result
 result-*

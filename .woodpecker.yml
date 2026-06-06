@@ -1,0 +1,10 @@
+when:
+  - event: [push, pull_request]
+
+steps:
+  - name: flake-check
+    image: nixos/nix:latest
+    commands:
+      - mkdir -p /etc/nix
+      - echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf
+      - nix flake check
