@@ -1,30 +1,37 @@
-From 8189f959e319ad8353d3dbd6ae494a6cafb59524 Mon Sep 17 00:00:00 2001
+From 0ac5f82e61098a7d5461ef3be4742eae0813f59a Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Tue, 28 Apr 2026 12:45:05 +0200
-Subject: [PATCH] screencast: restore with regex rescue aliases
+Subject: [PATCH] screencast: implement restore_policy rescue and source_label
 
----
- Cargo.toml                            |   1 +
- i18n/en/xdg_desktop_portal_cosmic.ftl |   9 +
- src/main.rs                           |   4 +
- src/screencast.rs                     | 776 +++++++++++++++++++++++++-
- src/screencast_dialog.rs              | 511 ++++++++++++++++-
- src/wayland/mod.rs                    |  64 +++
- 6 files changed, 1328 insertions(+), 37 deletions(-)
+Signed-off-by: Can H. Tartanoglu <gpg@rotas.mozmail.com>
 
+diff --git a/Cargo.lock b/Cargo.lock
+index 6945f9c..2005b78 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -9138,2 +9138,3 @@ dependencies = [
+  "serde",
++ "regex",
+  "tempfile",
 diff --git a/Cargo.toml b/Cargo.toml
-index 643d8ec..3f8d06f 100644
+index 1a5d801..b464372 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -32,2 +32,3 @@ pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", featur
+@@ -30,6 +30,7 @@ pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", featur
+     "v0_3_33",
+ ] }
  png = "0.18"
-+regex = "1.12.2"
++regex = "1.12"
  rustix = { version = "1.1", features = ["fs"] }
+ # spa_sys = { package = "libspa-sys", git = "https://github.com/pop-os/pipewire-rs" }
+ zbus = { version = "5.11.0", default-features = false, features = ["tokio"] }
 diff --git a/i18n/en/xdg_desktop_portal_cosmic.ftl b/i18n/en/xdg_desktop_portal_cosmic.ftl
 index 5e6fe12..c7dc777 100644
 --- a/i18n/en/xdg_desktop_portal_cosmic.ftl
 +++ b/i18n/en/xdg_desktop_portal_cosmic.ftl
-@@ -15 +15,10 @@ output = Output
+@@ -13,3 +13,12 @@ share-screen = Share your screen
+ unknown-application = Unknown Application
+ output = Output
  window = Window
 +rescue-exact = This window only
 +rescue-app = Any window from this app
@@ -36,42 +43,56 @@ index 5e6fe12..c7dc777 100644
 +rescue-alias-add = Add alias
 +rescue-invalid-regex = Invalid regex alias
 diff --git a/src/main.rs b/src/main.rs
-index 7ef3cf4..f762e6d 100644
+index 55cf2df..fb58168 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -37,2 +37,3 @@ enum PortalResponse<T: zvariant::Type + serde::Serialize> {
+@@ -35,6 +35,7 @@ enum PortalResponse<T: zvariant::Type + serde::Serialize> {
+     Success(T),
+     Cancelled,
      Other,
 +    OtherWithResults(T),
  }
-@@ -53,2 +54,5 @@ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T
+
+ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T> {
+@@ -51,6 +52,9 @@ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T
+                 HashMap::<String, zvariant::Value>::new(),
+             )
                  .serialize(serializer),
 +            Self::OtherWithResults(res) => {
 +                (PORTAL_RESPONSE_OTHER, res).serialize(serializer)
 +            }
          }
+     }
+ }
 diff --git a/src/screencast.rs b/src/screencast.rs
-index b31f604..3de2b49 100644
+index b31f604..5f0636f 100644
 --- a/src/screencast.rs
 +++ b/src/screencast.rs
-@@ -4,3 +4,4 @@ use ashpd::{desktop::screencast::SourceType, enumflags2::BitFlags};
+@@ -4,13 +4,18 @@ use ashpd::enumflags2::BitFlags;
  use futures::stream::{FuturesOrdered, StreamExt};
--use std::{collections::HashMap, mem};
-+use regex::RegexBuilder;
-+use std::{collections::HashMap, mem, time::Duration};
+ use std::collections::HashMap;
+ use std::mem;
++use std::time::Duration;
  use tokio::sync::mpsc::Sender;
-@@ -8,3 +9,5 @@ use zbus::zvariant;
- 
+ use zbus::zvariant;
+
 -use crate::screencast_dialog::{self, CaptureSources};
 +use crate::screencast_dialog::{
 +    self, CaptureSources, RestoreAliasSeed, RestoreMatchRule, RestoreMatchScope,
++    MAX_RESTORE_MATCH_RULES,
 +};
  use crate::screencast_thread::ScreencastThread;
-@@ -13,2 +16,3 @@ use crate::wayland::{CaptureSource, WaylandHelper};
- use crate::{PortalResponse, Request};
+-use crate::wayland::{CaptureSource, WaylandHelper};
++use crate::wayland::{CaptureSource, RescueOutcome, WaylandHelper};
+ use crate::{PortalResponse, Request, subscription};
 +use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
- 
-@@ -28,6 +32,15 @@ struct CreateSessionResult {
- 
+
+ const CURSOR_MODE_HIDDEN: u32 = 1;
+ const CURSOR_MODE_EMBEDDED: u32 = 2;
+@@ -26,16 +30,27 @@ struct CreateSessionResult {
+     session_id: String,
+ }
+
 +/// Rescue mode controls how the portal matches windows after an app restart.
 +pub const RESCUE_MODE_EXACT: u32 = 0;
 +pub const RESCUE_MODE_APP: u32 = 1;
@@ -87,7 +108,7 @@ index b31f604..3de2b49 100644
 +    pub rescue_modes: Vec<u32>,
 +    pub rescue_match_rules: Vec<Vec<RestoreMatchRule>>,
  }
-@@ -35,5 +48,7 @@ struct PersistedCaptureSources {
+
  impl PersistedCaptureSources {
 -    fn from_capture_sources(
 +    pub(crate) fn from_capture_sources(
@@ -96,12 +117,19 @@ index b31f604..3de2b49 100644
 +        rescue_modes: &[u32],
 +        source_match_rules: &[RestoreMatchRule],
      ) -> Option<Self> {
-@@ -46,2 +61,4 @@ impl PersistedCaptureSources {
+         let mut outputs = Vec::new();
+         for handle in &sources.outputs {
+@@ -44,34 +59,344 @@ impl PersistedCaptureSources {
+         }
+
          let mut toplevels = Vec::new();
 +        let mut toplevel_app_ids = Vec::new();
 +        let mut toplevel_titles = Vec::new();
          let toplevel_infos = wayland_helper.toplevels();
-@@ -52,8 +69,45 @@ impl PersistedCaptureSources {
+         for handle in &sources.toplevels {
+             let info = toplevel_infos
+                 .iter()
+                 .find(|t| t.foreign_toplevel == *handle)?;
              toplevels.push(info.identifier.clone());
 +            toplevel_app_ids.push(info.app_id.clone());
 +            toplevel_titles.push(info.title.clone());
@@ -122,7 +150,7 @@ index b31f604..3de2b49 100644
 +                *rules = source_match_rules.to_vec();
 +            }
          }
- 
+
 -        Some(Self { outputs, toplevels })
 +        Some(Self {
 +            outputs,
@@ -141,106 +169,105 @@ index b31f604..3de2b49 100644
 +        let toplevel_infos = wayland_helper.toplevels();
 +        self.to_capture_sources_with(&toplevel_infos, wayland_helper)
      }
- 
+
 -    fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
++    pub(crate) fn needs_consent_with(&self, toplevel_infos: &[ToplevelInfo]) -> bool {
++        self.toplevels.iter().enumerate().any(|(i, identifier)| {
++            let app_id = self.toplevel_app_ids.get(i);
++            let title = self.toplevel_titles.get(i);
++            let mode = self.rescue_modes.get(i).copied().unwrap_or(RESCUE_MODE_APP);
++            let rules = self
++                .rescue_match_rules
++                .get(i)
++                .map(Vec::as_slice)
++                .unwrap_or_default();
++
++            matches!(
++                resolve_toplevel_match(
++                    identifier,
++                    mode,
++                    app_id.map(String::as_str),
++                    title.map(String::as_str),
++                    rules,
++                    toplevel_infos,
++                ),
++                Some(ToplevelMatch::NeedsConsent)
++            )
++        })
++    }
++
 +    pub(crate) fn to_capture_sources_with(
 +        &self,
 +        toplevel_infos: &[ToplevelInfo],
 +        wayland_helper: &WaylandHelper,
 +    ) -> Option<CaptureSources> {
          let mut outputs = Vec::new();
-@@ -63,12 +117,198 @@ impl PersistedCaptureSources {
- 
+         for name in &self.outputs {
+             outputs.push(wayland_helper.output_for_name(name)?);
+         }
+
 +        // All-or-nothing: if any toplevel fails to match, return None
 +        // and discard the (local) partial results.
          let mut toplevels = Vec::new();
 -        let toplevel_infos = wayland_helper.toplevels();
 -        for identifier in &self.toplevels {
 -            let info = toplevel_infos
--                .iter()
--                .find(|t| t.identifier == *identifier)?;
--            toplevels.push(info.foreign_toplevel.clone());
 +        for (i, identifier) in self.toplevels.iter().enumerate() {
 +            let app_id = self.toplevel_app_ids.get(i);
 +            let title = self.toplevel_titles.get(i);
 +            let mode = self.rescue_modes.get(i).copied().unwrap_or(RESCUE_MODE_APP);
++            let rules = self
++                .rescue_match_rules
++                .get(i)
++                .map(Vec::as_slice)
++                .unwrap_or_default();
 +
-+            // Tier 1 (all modes): exact identifier match
-+            if let Some(info) = toplevel_infos.iter().find(|t| {
-+                match_candidate(
-+                    &t.identifier,
-+                    identifier,
-+                    mode,
-+                    app_id.map(String::as_str),
-+                    title.map(String::as_str),
-+                    &[],
-+                    &t.app_id,
-+                    &t.title,
-+                ) == Some(MatchKind::Exact)
-+            }) {
-+                toplevels.push(info.foreign_toplevel.clone());
-+                continue;
-+            }
-+
-+            // Mode 0 (Exact): no fallback
-+            if mode == RESCUE_MODE_EXACT {
-+                log::debug!("restore: exact match failed for identifier={}", identifier);
-+                return None;
-+            }
-+
-+            // Mode 2 (Title): app_id + title match
-+            if mode == RESCUE_MODE_TITLE {
-+                if let Some(info) = self.rescue_match_rules.get(i).and_then(|rules| {
-+                    match_title_regex_rules(rules, app_id.map(String::as_str), toplevel_infos)
-+                }) {
++            match resolve_toplevel_match(
++                identifier,
++                mode,
++                app_id.map(String::as_str),
++                title.map(String::as_str),
++                rules,
++                toplevel_infos,
++            ) {
++                Some(ToplevelMatch::Auto(info)) => {
 +                    toplevels.push(info.foreign_toplevel.clone());
-+                    continue;
 +                }
-+
-+                if let (Some(aid), Some(t)) = (app_id, title) {
-+                    if !aid.is_empty() {
-+                        if let Some(info) = toplevel_infos
-+                            .iter()
-+                            .find(|ti| ti.app_id == *aid && ti.title == *t)
-+                        {
-+                            toplevels.push(info.foreign_toplevel.clone());
-+                            continue;
++                Some(ToplevelMatch::NeedsConsent) => {
++                    log::info!(
++                        "restore: title alias matched outside unattended rescue boundary for app_id={:?} title={:?}",
++                        app_id,
++                        title,
++                    );
++                    return None;
++                }
++                None => {
++                    if mode == RESCUE_MODE_EXACT {
++                        log::debug!("restore: exact match failed for identifier={}", identifier);
++                    } else if mode == RESCUE_MODE_TITLE {
++                        if let Some(aid) = app_id {
++                            if !aid.is_empty() && toplevel_infos.iter().any(|ti| ti.app_id == *aid)
++                            {
++                                log::debug!(
++                                    "restore: app_id={} matched but title={:?} did not",
++                                    aid,
++                                    title,
++                                );
++                            }
 +                        }
-+                    }
-+                }
-+                // Log when app_id matches but title doesn't (helps diagnose brittleness)
-+                if let Some(aid) = app_id {
-+                    if !aid.is_empty() && toplevel_infos.iter().any(|ti| ti.app_id == *aid) {
 +                        log::debug!(
-+                            "restore: app_id={} matched but title={:?} did not",
-+                            aid,
++                            "restore: title match failed for app_id={:?} title={:?}",
++                            app_id,
 +                            title,
 +                        );
++                    } else {
++                        log::debug!("restore: app match failed for app_id={:?}", app_id);
 +                    }
-+                }
-+                log::debug!(
-+                    "restore: title match failed for app_id={:?} title={:?}",
-+                    app_id,
-+                    title,
-+                );
-+                return None;
-+            }
-+
-+            // Mode 1 (App): app_id only — grab any window from this app
-+            if let Some(aid) = app_id {
-+                if !aid.is_empty() {
-+                    if let Some(info) = toplevel_infos.iter().find(|ti| ti.app_id == *aid) {
-+                        toplevels.push(info.foreign_toplevel.clone());
-+                        continue;
-+                    }
++                    return None;
 +                }
 +            }
++        }
 +
-+            log::debug!("restore: app match failed for app_id={:?}", app_id);
-+            return None;
-         }
- 
--        Some(CaptureSources { outputs, toplevels })
 +        Some(CaptureSources {
 +            outputs,
 +            toplevels,
@@ -273,7 +300,7 @@ index b31f604..3de2b49 100644
 +) -> Option<&'a ToplevelInfo> {
 +    for rule in rules {
 +        for info in toplevel_infos {
-+            if title_regex_rule_matches(rule, saved_app_id, &info.app_id, &info.title) {
++            if title_regex_rule_auto_matches(rule, saved_app_id, &info.app_id, &info.title) {
 +                return Some(info);
 +            }
 +        }
@@ -289,6 +316,70 @@ index b31f604..3de2b49 100644
 +    App,
 +}
 +
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum MatchDecision {
++    Auto(MatchKind),
++    NeedsConsent,
++}
++
++enum ToplevelMatch<'a> {
++    Auto(&'a ToplevelInfo),
++    NeedsConsent,
++}
++
++fn resolve_toplevel_match<'a>(
++    saved_identifier: &str,
++    mode: u32,
++    saved_app_id: Option<&str>,
++    saved_title: Option<&str>,
++    rules: &[RestoreMatchRule],
++    toplevel_infos: &'a [ToplevelInfo],
++) -> Option<ToplevelMatch<'a>> {
++    if let Some(info) = toplevel_infos
++        .iter()
++        .find(|info| info.identifier == saved_identifier)
++    {
++        return Some(ToplevelMatch::Auto(info));
++    }
++    if mode == RESCUE_MODE_EXACT {
++        return None;
++    }
++
++    if let (Some(app_id), Some(title)) = (saved_app_id, saved_title) {
++        if !app_id.is_empty() {
++            if let Some(info) = toplevel_infos
+                 .iter()
+-                .find(|t| t.identifier == *identifier)?;
+-            toplevels.push(info.foreign_toplevel.clone());
++                .find(|info| info.app_id == app_id && info.title == title)
++            {
++                return Some(ToplevelMatch::Auto(info));
++            }
++        }
++    }
++
++    if mode == RESCUE_MODE_TITLE {
++        if let Some(info) = match_title_regex_rules(rules, saved_app_id, toplevel_infos) {
++            return Some(ToplevelMatch::Auto(info));
++        }
++        if title_regex_rules_need_consent(rules, saved_app_id, toplevel_infos) {
++            return Some(ToplevelMatch::NeedsConsent);
++        }
++        return None;
++    }
++
++    // Mode 1 (App): app_id only, after exact identifier/title specificity.
++    if let Some(app_id) = saved_app_id {
++        if !app_id.is_empty() {
++            if let Some(info) = toplevel_infos.iter().find(|info| info.app_id == app_id) {
++                return Some(ToplevelMatch::Auto(info));
++            }
++        }
++    }
++
++    None
++}
++
 +fn match_candidate(
 +    candidate_identifier: &str,
 +    saved_identifier: &str,
@@ -298,32 +389,68 @@ index b31f604..3de2b49 100644
 +    rules: &[RestoreMatchRule],
 +    candidate_app_id: &str,
 +    candidate_title: &str,
-+) -> Option<MatchKind> {
++) -> Option<MatchDecision> {
 +    if candidate_identifier == saved_identifier {
-+        return Some(MatchKind::Exact);
++        return Some(MatchDecision::Auto(MatchKind::Exact));
 +    }
 +    if mode == RESCUE_MODE_EXACT {
 +        return None;
 +    }
-+    if mode == RESCUE_MODE_TITLE {
-+        if rules.iter().any(|rule| {
-+            title_regex_rule_matches(rule, saved_app_id, candidate_app_id, candidate_title)
-+        }) {
-+            return Some(MatchKind::Regex);
++    if let (Some(app_id), Some(title)) = (saved_app_id, saved_title) {
++        if !app_id.is_empty() && candidate_app_id == app_id && candidate_title == title {
++            return Some(MatchDecision::Auto(MatchKind::Title));
 +        }
-+        if let (Some(app_id), Some(title)) = (saved_app_id, saved_title) {
-+            if !app_id.is_empty() && candidate_app_id == app_id && candidate_title == title {
-+                return Some(MatchKind::Title);
++    }
++    if mode == RESCUE_MODE_TITLE {
++        let mut needs_consent = false;
++        for rule in rules {
++            if title_regex_rule_matches(rule, saved_app_id, candidate_app_id, candidate_title) {
++                if title_regex_rule_auto_matches(
++                    rule,
++                    saved_app_id,
++                    candidate_app_id,
++                    candidate_title,
++                ) {
++                    return Some(MatchDecision::Auto(MatchKind::Regex));
++                }
++                needs_consent = true;
 +            }
+         }
++        if needs_consent {
++            return Some(MatchDecision::NeedsConsent);
 +        }
 +        return None;
 +    }
 +    if let Some(app_id) = saved_app_id {
 +        if !app_id.is_empty() && candidate_app_id == app_id {
-+            return Some(MatchKind::App);
++            return Some(MatchDecision::Auto(MatchKind::App));
 +        }
 +    }
 +    None
++}
+
+-        Some(CaptureSources { outputs, toplevels })
++fn title_regex_rules_need_consent(
++    rules: &[RestoreMatchRule],
++    saved_app_id: Option<&str>,
++    toplevel_infos: &[ToplevelInfo],
++) -> bool {
++    rules.iter().any(|rule| {
++        toplevel_infos.iter().any(|info| {
++            title_regex_rule_matches(rule, saved_app_id, &info.app_id, &info.title)
++                && !title_regex_rule_auto_matches(rule, saved_app_id, &info.app_id, &info.title)
++        })
++    })
++}
++
++fn title_regex_rule_auto_matches(
++    rule: &RestoreMatchRule,
++    saved_app_id: Option<&str>,
++    candidate_app_id: &str,
++    candidate_title: &str,
++) -> bool {
++    matches!(rule.scope, RestoreMatchScope::SameApp)
++        && title_regex_rule_matches(rule, saved_app_id, candidate_app_id, candidate_title)
 +}
 +
 +fn title_regex_rule_matches(
@@ -339,28 +466,20 @@ index b31f604..3de2b49 100644
 +        if app_id.is_empty() || candidate_app_id != app_id {
 +            return false;
 +        }
-+    }
-+
-+    match RegexBuilder::new(&rule.pattern)
-+        .case_insensitive(true)
-+        .build()
-+    {
-+        Ok(re) => re.is_match(candidate_title),
-+        Err(err) => {
-+            log::warn!(
-+                "restore: ignoring invalid title_regex rescue rule {:?}: {}",
-+                rule.pattern,
-+                err
-+            );
-+            false
-+        }
      }
-@@ -88,3 +328,3 @@ impl From<PersistedCaptureSources> for RestoreData {
++
++    rule.is_match(candidate_title)
+ }
+
+ #[derive(Debug, serde::Serialize, serde::Deserialize, zvariant::Type)]
+@@ -86,10 +411,33 @@ impl From<PersistedCaptureSources> for RestoreData {
+     fn from(sources: PersistedCaptureSources) -> RestoreData {
+         RestoreData {
              vendor: "COSMIC".to_string(),
 -            version: 1,
 +            version: 3,
              data: zvariant::Value::from(zvariant::Structure::from((
-@@ -92,2 +332,25 @@ impl From<PersistedCaptureSources> for RestoreData {
+                 sources.outputs,
                  sources.toplevels,
 +                sources.toplevel_app_ids,
 +                sources.toplevel_titles,
@@ -386,12 +505,16 @@ index b31f604..3de2b49 100644
 +                    })
 +                    .collect::<Vec<_>>(),
              )))
-@@ -102,3 +365,3 @@ impl TryFrom<&RestoreData> for PersistedCaptureSources {
+             .try_to_owned()
+             .unwrap(),
+@@ -100,12 +448,124 @@ impl From<PersistedCaptureSources> for RestoreData {
+ impl TryFrom<&RestoreData> for PersistedCaptureSources {
+     type Error = ();
      fn try_from(restore_data: &RestoreData) -> Result<Self, ()> {
 -        if (&*restore_data.vendor, restore_data.version) != ("COSMIC", 1) {
 +        if restore_data.vendor != "COSMIC" {
              return Err(());
-@@ -106,4 +369,108 @@ impl TryFrom<&RestoreData> for PersistedCaptureSources {
+         }
          let structure = zvariant::Structure::try_from(&*restore_data.data).map_err(|_| ())?;
 -        let (outputs, toplevels) = structure.try_into().map_err(|_| ())?;
 -        Ok(PersistedCaptureSources { outputs, toplevels })
@@ -469,6 +592,13 @@ index b31f604..3de2b49 100644
 +                {
 +                    let mut rules = Vec::new();
 +                    for (pattern, scope) in patterns.into_iter().zip(scopes.into_iter()) {
++                        if rules.len() >= MAX_RESTORE_MATCH_RULES {
++                            log::warn!(
++                                "restore: dropping title_regex rules beyond limit {}",
++                                MAX_RESTORE_MATCH_RULES
++                            );
++                            continue;
++                        }
 +                        let Some(scope) = RestoreMatchScope::from_str(&scope) else {
 +                            log::warn!(
 +                                "restore: ignoring title_regex rule with invalid scope {:?}",
@@ -476,16 +606,17 @@ index b31f604..3de2b49 100644
 +                            );
 +                            continue;
 +                        };
-+                        if let Err(err) = RegexBuilder::new(&pattern).case_insensitive(true).build()
-+                        {
-+                            log::warn!(
-+                                "restore: ignoring malformed title_regex rule {:?}: {}",
-+                                pattern,
-+                                err
-+                            );
-+                            continue;
-+                        }
-+                        rules.push(RestoreMatchRule { pattern, scope });
++                        let rule = match RestoreMatchRule::new(pattern, scope) {
++                            Ok(rule) => rule,
++                            Err(err) => {
++                                log::warn!(
++                                    "restore: ignoring malformed title_regex rule: {}",
++                                    err
++                                );
++                                continue;
++                            }
++                        };
++                        rules.push(rule);
 +                    }
 +                    rescue_match_rules.push(rules);
 +                }
@@ -502,7 +633,11 @@ index b31f604..3de2b49 100644
 +            _ => Err(()),
 +        }
      }
-@@ -124,2 +491,12 @@ struct SelectSourcesOptions {
+ }
+
+@@ -122,6 +582,16 @@ struct SelectSourcesOptions {
+     restore_data: Option<RestoreData>,
+     // Default: 0
      persist_mode: Option<u32>,
 +    source_label: Option<String>,
 +    restore_policy: Option<HashMap<String, zvariant::OwnedValue>>,
@@ -515,18 +650,30 @@ index b31f604..3de2b49 100644
 +    action: u32,
 +    token_invalid: bool,
  }
-@@ -142,2 +519,3 @@ struct StartResult {
+
+ #[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
+@@ -140,6 +610,7 @@ struct StartResult {
+     streams: Vec<(u32, StreamProps)>,
+     persist_mode: Option<u32>,
      restore_data: Option<RestoreData>,
 +    restore_failure: Option<RestoreFailureResult>,
  }
-@@ -151,2 +529,5 @@ struct SessionData {
+
+ #[derive(Default)]
+@@ -149,6 +620,9 @@ struct SessionData {
+     multiple: bool,
+     source_types: BitFlags<SourceType>,
      persisted_capture_sources: Option<PersistedCaptureSources>,
 +    source_label: Option<String>,
 +    source_unavailable_action: u32,
 +    restore_match_rules: Vec<RestoreMatchRule>,
      closed: bool,
-@@ -163,2 +544,118 @@ impl SessionData {
- 
+ }
+
+@@ -161,6 +635,127 @@ impl SessionData {
+     }
+ }
+
 +/// Sanitize a user-provided label per the ScreenCast v6 spec:
 +/// strip control characters, truncate to 256 bytes, normalize empty to None.
 +fn sanitize_label(input: Option<String>) -> Option<String> {
@@ -593,6 +740,14 @@ index b31f604..3de2b49 100644
 +) -> Vec<RestoreMatchRule> {
 +    let mut parsed = Vec::new();
 +    for rule in rules.unwrap_or_default() {
++        if parsed.len() >= MAX_RESTORE_MATCH_RULES {
++            log::warn!(
++                "restore: dropping external title_regex rules beyond limit {}",
++                MAX_RESTORE_MATCH_RULES
++            );
++            continue;
++        }
++
 +        let kind = rule.get("kind").and_then(owned_value_string);
 +        if kind.as_deref() != Some("title_regex") {
 +            continue;
@@ -631,20 +786,21 @@ index b31f604..3de2b49 100644
 +        None => RestoreMatchScope::SameApp,
 +    };
 +
-+    if let Err(err) = RegexBuilder::new(&pattern).case_insensitive(true).build() {
-+        log::warn!(
-+            "restore: ignoring invalid external title_regex rule {:?}: {}",
-+            pattern,
-+            err
-+        );
-+        return None;
++    match RestoreMatchRule::new(pattern, scope) {
++        Ok(rule) => Some(rule),
++        Err(err) => {
++            log::warn!("restore: ignoring invalid external title_regex rule: {}", err);
++            None
++        }
 +    }
-+
-+    Some(RestoreMatchRule { pattern, scope })
 +}
 +
  pub struct ScreenCast {
-@@ -225,2 +722,7 @@ impl ScreenCast {
+     wayland_helper: WaylandHelper,
+     tx: Sender<subscription::Event>,
+@@ -223,6 +818,11 @@ impl ScreenCast {
+                         log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
+                     }
                  }
 +                session_data.source_label = sanitize_label(options.source_label);
 +                session_data.source_unavailable_action =
@@ -652,8 +808,12 @@ index b31f604..3de2b49 100644
 +                session_data.restore_match_rules =
 +                    parse_restore_match_rules(options.restore_match_rules);
                  PortalResponse::Success(HashMap::new())
-@@ -248,3 +750,11 @@ impl ScreenCast {
- 
+             }
+             None => PortalResponse::Other,
+@@ -246,17 +846,31 @@ impl ScreenCast {
+                 return PortalResponse::Other;
+             };
+
 -            let (cursor_mode, multiple, source_types, persisted_capture_sources) = {
 +            let (
 +                cursor_mode,
@@ -665,19 +825,27 @@ index b31f604..3de2b49 100644
 +                restore_match_rules,
 +            ) = {
                  let session_data = interface.get_mut().await;
-@@ -254,2 +764,5 @@ impl ScreenCast {
+                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_HIDDEN);
+                 let multiple = session_data.multiple;
+                 let source_types = session_data.source_types;
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
 +                let source_label = session_data.source_label.clone();
 +                let source_unavailable_action = session_data.source_unavailable_action;
 +                let restore_match_rules = session_data.restore_match_rules.clone();
                  (
-@@ -259,2 +772,5 @@ impl ScreenCast {
+                     cursor_mode,
+                     multiple,
+                     source_types,
                      persisted_capture_sources,
 +                    source_label,
 +                    source_unavailable_action,
 +                    restore_match_rules,
                  )
-@@ -270,7 +786,74 @@ impl ScreenCast {
+             };
+
+@@ -268,11 +882,121 @@ impl ScreenCast {
+             }
+
              let capture_sources = if let Some(capture_sources) =
 -                persisted_capture_sources.and_then(|x| x.to_capture_sources(&self.wayland_helper))
 +                persisted_capture_sources
@@ -695,7 +863,27 @@ index b31f604..3de2b49 100644
 +                            source_label,
 +                        );
 +                        match self.wayland_helper.check_or_rescue(persisted) {
-+                            Ok(sources) => sources,
++                            Ok(RescueOutcome::Sources(sources)) => sources,
++                            Ok(RescueOutcome::NeedsConsent) => {
++                                log::info!(
++                                    "restore rescue requires re-consent, showing picker (source_label={:?})",
++                                    source_label,
++                                );
++                                let resp = screencast_dialog::show_screencast_prompt(
++                                    &self.tx,
++                                    &session_handle,
++                                    app_id,
++                                    multiple,
++                                    source_types,
++                                    &self.wayland_helper,
++                                    persisted.restore_alias_seeds(),
++                                )
++                                .await;
++                                let Some(capture_sources) = resp else {
++                                    return PortalResponse::Cancelled;
++                                };
++                                capture_sources
++                            }
 +                            Err(maybe_rx) => {
 +                                let rescue_result = match maybe_rx {
 +                                    Some(rx) => tokio::time::timeout(
@@ -707,26 +895,49 @@ index b31f604..3de2b49 100644
 +                                    .and_then(|r| r.ok()),
 +                                    None => None,
 +                                };
-+                                if let Some(sources) = rescue_result {
-+                                    log::info!("rescue succeeded");
-+                                    sources
-+                                } else {
-+                                    log::info!(
-+                                        "rescue cancelled/failed, applying restore action={}",
-+                                        source_unavailable_action,
-+                                    );
-+                                    if source_unavailable_action == 1 {
-+                                        return PortalResponse::Cancelled;
-+                                    } else {
-+                                        return PortalResponse::OtherWithResults(StartResult {
-+                                            streams: vec![],
-+                                            persist_mode: None,
-+                                            restore_data: None,
-+                                            restore_failure: Some(restore_failure_result(
-+                                                "source_unavailable",
-+                                                source_unavailable_action,
-+                                            )),
-+                                        });
++                                match rescue_result {
++                                    Some(RescueOutcome::Sources(sources)) => {
++                                        log::info!("rescue succeeded");
++                                        sources
++                                    }
++                                    Some(RescueOutcome::NeedsConsent) => {
++                                        log::info!(
++                                            "restore rescue requires re-consent, showing picker (source_label={:?})",
++                                            source_label,
++                                        );
++                                        let resp = screencast_dialog::show_screencast_prompt(
++                                            &self.tx,
++                                            &session_handle,
++                                            app_id,
++                                            multiple,
++                                            source_types,
++                                            &self.wayland_helper,
++                                            persisted.restore_alias_seeds(),
++                                        )
++                                        .await;
++                                        let Some(capture_sources) = resp else {
++                                            return PortalResponse::Cancelled;
++                                        };
++                                        capture_sources
++                                    }
++                                    None => {
++                                        log::info!(
++                                            "rescue cancelled/failed, applying restore action={}",
++                                            source_unavailable_action,
++                                        );
++                                        if source_unavailable_action == 1 {
++                                            return PortalResponse::Cancelled;
++                                        } else {
++                                            return PortalResponse::OtherWithResults(StartResult {
++                                                streams: vec![],
++                                                persist_mode: None,
++                                                restore_data: None,
++                                                restore_failure: Some(restore_failure_result(
++                                                    "source_unavailable",
++                                                    source_unavailable_action,
++                                                )),
++                                            });
++                                        }
 +                                    }
 +                                }
 +                            }
@@ -754,12 +965,20 @@ index b31f604..3de2b49 100644
 -                // Show dialog to prompt for what to capture
 +                // No restore data: show picker dialog
                  let resp = screencast_dialog::show_screencast_prompt(
-@@ -282,2 +865,3 @@ impl ScreenCast {
+                     &self.tx,
+                     &session_handle,
+@@ -280,6 +1004,7 @@ impl ScreenCast {
+                     multiple,
+                     source_types,
                      &self.wayland_helper,
 +                    Vec::new(),
                  )
-@@ -374,2 +958,12 @@ impl ScreenCast {
- 
+                 .await;
+                 let Some(capture_sources) = resp else {
+@@ -372,15 +1097,28 @@ impl ScreenCast {
+                 .collect();
+             interface.get_mut().await.screencast_threads = screencast_threads;
+
 +            // Use rescue modes from the dialog selection if available,
 +            // otherwise from existing persisted data, otherwise default
 +            let rescue_modes = if !capture_sources.rescue_modes.is_empty() {
@@ -771,16 +990,23 @@ index b31f604..3de2b49 100644
 +                    .unwrap_or_default()
 +            };
              let persisted_capture_sources = PersistedCaptureSources::from_capture_sources(
-@@ -377,2 +971,4 @@ impl ScreenCast {
+                 &self.wayland_helper,
                  &capture_sources,
 +                &rescue_modes,
 +                &restore_match_rules,
              );
-@@ -383,2 +979,3 @@ impl ScreenCast {
+
+             PortalResponse::Success(StartResult {
+                 streams,
+                 persist_mode: None,
                  restore_data: persisted_capture_sources.map(|x| x.into()),
 +                restore_failure: None,
              })
-@@ -401,3 +998,140 @@ impl ScreenCast {
+         })
+         .await
+@@ -399,6 +1137,227 @@ impl ScreenCast {
+
+     #[zbus(property, name = "version")]
      async fn version(&self) -> u32 {
 -        4
 +        6
@@ -792,10 +1018,7 @@ index b31f604..3de2b49 100644
 +    use super::*;
 +
 +    fn rule(pattern: &str, scope: RestoreMatchScope) -> RestoreMatchRule {
-+        RestoreMatchRule {
-+            pattern: pattern.to_string(),
-+            scope,
-+        }
++        RestoreMatchRule::new(pattern.to_string(), scope).unwrap()
 +    }
 +
 +    #[test]
@@ -826,7 +1049,7 @@ index b31f604..3de2b49 100644
 +                "code",
 +                "project-b"
 +            ),
-+            Some(MatchKind::Exact)
++            Some(MatchDecision::Auto(MatchKind::Exact))
 +        );
 +        assert_eq!(
 +            match_candidate(
@@ -839,7 +1062,7 @@ index b31f604..3de2b49 100644
 +                "code",
 +                "project-b"
 +            ),
-+            Some(MatchKind::Regex)
++            Some(MatchDecision::Auto(MatchKind::Regex))
 +        );
 +        assert_eq!(
 +            match_candidate(
@@ -852,7 +1075,7 @@ index b31f604..3de2b49 100644
 +                "code",
 +                "project-a"
 +            ),
-+            Some(MatchKind::Title)
++            Some(MatchDecision::Auto(MatchKind::Title))
 +        );
 +        assert_eq!(
 +            match_candidate(
@@ -865,7 +1088,56 @@ index b31f604..3de2b49 100644
 +                "code",
 +                "project-b"
 +            ),
-+            Some(MatchKind::App)
++            Some(MatchDecision::Auto(MatchKind::App))
++        );
++    }
++
++    #[test]
++    fn unattended_any_app_regex_requires_reconsent() {
++        let rules = vec![rule(".", RestoreMatchScope::AnyApp)];
++        assert_eq!(
++            match_candidate(
++                "id-password-manager",
++                "id-code",
++                RESCUE_MODE_TITLE,
++                Some("code"),
++                Some("project-a"),
++                &rules,
++                "password-manager",
++                "Vault"
++            ),
++            Some(MatchDecision::NeedsConsent)
++        );
++        assert_eq!(
++            match_candidate(
++                "id-code-2",
++                "id-code",
++                RESCUE_MODE_TITLE,
++                Some("code"),
++                Some("project-a"),
++                &rules,
++                "code",
++                "project-b"
++            ),
++            Some(MatchDecision::NeedsConsent)
++        );
++    }
++
++    #[test]
++    fn unattended_same_app_regex_can_auto_match() {
++        let rules = vec![rule("project-b", RestoreMatchScope::SameApp)];
++        assert_eq!(
++            match_candidate(
++                "id-code-2",
++                "id-code",
++                RESCUE_MODE_TITLE,
++                Some("code"),
++                Some("project-a"),
++                &rules,
++                "code",
++                "project-b"
++            ),
++            Some(MatchDecision::Auto(MatchKind::Regex))
 +        );
 +    }
 +
@@ -904,7 +1176,8 @@ index b31f604..3de2b49 100644
 +            .unwrap(),
 +        };
 +        let v1_sources = PersistedCaptureSources::try_from(&v1).unwrap();
-+        assert_eq!(v1_sources.rescue_match_rules, vec![Vec::new()]);
++        assert_eq!(v1_sources.rescue_match_rules.len(), 1);
++        assert!(v1_sources.rescue_match_rules[0].is_empty());
 +
 +        let v2 = RestoreData {
 +            vendor: "COSMIC".to_string(),
@@ -920,37 +1193,108 @@ index b31f604..3de2b49 100644
 +            .unwrap(),
 +        };
 +        let v2_sources = PersistedCaptureSources::try_from(&v2).unwrap();
-+        assert_eq!(v2_sources.rescue_match_rules, vec![Vec::new()]);
++        assert_eq!(v2_sources.rescue_match_rules.len(), 1);
++        assert!(v2_sources.rescue_match_rules[0].is_empty());
++    }
++
++    #[test]
++    fn v3_restore_data_caps_alias_rules() {
++        let patterns = (0..=MAX_RESTORE_MATCH_RULES)
++            .map(|idx| format!("project-{idx}"))
++            .collect::<Vec<_>>();
++        let scopes = vec!["same_app".to_string(); MAX_RESTORE_MATCH_RULES + 1];
++        let v3 = RestoreData {
++            vendor: "COSMIC".to_string(),
++            version: 3,
++            data: zvariant::Value::from(zvariant::Structure::from((
++                Vec::<String>::new(),
++                vec!["tl".to_string()],
++                vec!["code".to_string()],
++                vec!["project-a".to_string()],
++                vec![RESCUE_MODE_TITLE],
++                vec![patterns],
++                vec![scopes],
++            )))
++            .try_to_owned()
++            .unwrap(),
++        };
++        let sources = PersistedCaptureSources::try_from(&v3).unwrap();
++        assert_eq!(sources.rescue_match_rules[0].len(), MAX_RESTORE_MATCH_RULES);
++    }
++
++    #[test]
++    fn overlong_external_patterns_are_ignored() {
++        assert!(
++            parse_external_restore_match_rule(
++                "a".repeat(crate::screencast_dialog::MAX_RESTORE_MATCH_PATTERN_BYTES + 1),
++                None
++            )
++            .is_none()
++        );
      }
+ }
 diff --git a/src/screencast_dialog.rs b/src/screencast_dialog.rs
-index 22c33f1..c055a81 100644
+index 935e1cf..b1f0fd6 100644
 --- a/src/screencast_dialog.rs
 +++ b/src/screencast_dialog.rs
-@@ -2,2 +2,3 @@ use crate::app::CosmicPortal;
+@@ -1,5 +1,6 @@
+ use crate::app::CosmicPortal;
  use crate::fl;
 +use crate::screencast::{RESCUE_MODE_APP, RESCUE_MODE_EXACT, RESCUE_MODE_TITLE};
  use crate::wayland::{CaptureSource, WaylandHelper};
-@@ -24,2 +25,4 @@ use freedesktop_desktop_entry::unicase::Ascii;
+ use crate::widget::keyboard_wrapper::KeyboardWrapper;
+ use ashpd::{desktop::screencast::SourceType, enumflags2::BitFlags};
+@@ -22,6 +23,8 @@ use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
+ use freedesktop_desktop_entry as fde;
+ use freedesktop_desktop_entry::unicase::Ascii;
  use freedesktop_desktop_entry::{DesktopEntry, get_languages_from_env};
-+use regex::RegexBuilder;
++use regex::{Regex, RegexBuilder};
 +use std::collections::HashMap;
  use std::mem;
-@@ -53,2 +56,3 @@ pub async fn show_screencast_prompt(
+ use std::sync::LazyLock;
+ use tokio::sync::mpsc;
+@@ -33,6 +36,11 @@ pub static SCREENCAST_ID: LazyLock<window::Id> = LazyLock::new(window::Id::uniqu
+ pub static SCREENCAST_WIDGET_ID: LazyLock<widget::Id> =
+     LazyLock::new(|| widget::Id::new("screencast".to_string()));
+
++pub const MAX_RESTORE_MATCH_RULES: usize = 64;
++pub const MAX_RESTORE_MATCH_PATTERN_BYTES: usize = 1024;
++const RESTORE_MATCH_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
++const RESTORE_MATCH_REGEX_DFA_SIZE_LIMIT: usize = 1024 * 1024;
++
+ pub async fn hide_screencast_prompt(
+     subscription_tx: &mpsc::Sender<crate::subscription::Event>,
+     session_handle: &zvariant::ObjectPath<'_>,
+@@ -51,6 +59,7 @@ pub async fn show_screencast_prompt(
+     multiple: bool,
+     source_types: BitFlags<SourceType>,
      wayland_helper: &WaylandHelper,
 +    restore_alias_seeds: Vec<RestoreAliasSeed>,
  ) -> Option<CaptureSources> {
-@@ -96,2 +100,5 @@ pub async fn show_screencast_prompt(
+     let locales = get_languages_from_env();
+     let desktop_entries = load_desktop_entries(&locales).await;
+@@ -94,6 +103,9 @@ pub async fn show_screencast_prompt(
+         app_name,
+         tx,
          capture_sources: Default::default(),
 +        rescue_mode_selections: HashMap::new(),
 +        rescue_alias_rows: HashMap::new(),
 +        restore_alias_seeds,
      };
-@@ -137,3 +144,3 @@ enum Tab {
- 
+     subscription_tx
+         .send(crate::subscription::Event::Screencast(args))
+@@ -135,7 +147,7 @@ enum Tab {
+     Windows,
+ }
+
 -#[derive(Debug, Clone)]
 +#[derive(Debug)]
  pub struct Args {
-@@ -148,2 +155,24 @@ pub struct Args {
+     session_handle: zvariant::ObjectPath<'static>,
+     multiple: bool,
+@@ -146,6 +158,28 @@ pub struct Args {
+     // Should be oneshot, but need `Clone` bound
+     tx: mpsc::Sender<Option<CaptureSources>>,
      capture_sources: CaptureSources,
 +    /// Per-toplevel rescue mode selection (keyed by toplevel handle).
 +    rescue_mode_selections: HashMap<ExtForeignToplevelHandleV1, u32>,
@@ -975,12 +1319,17 @@ index 22c33f1..c055a81 100644
 +        }
 +    }
  }
-@@ -160,2 +189,63 @@ impl Args {
- 
-+#[derive(Clone, Debug, PartialEq, Eq)]
+
+ impl Args {
+@@ -158,11 +192,105 @@ impl Args {
+     }
+ }
+
++#[derive(Clone, Debug)]
 +pub struct RestoreMatchRule {
 +    pub pattern: String,
 +    pub scope: RestoreMatchScope,
++    regex: Regex,
 +}
 +
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1003,6 +1352,34 @@ index 22c33f1..c055a81 100644
 +            title,
 +            rules,
 +        }
++    }
++}
++
++impl RestoreMatchRule {
++    pub fn new(pattern: String, scope: RestoreMatchScope) -> Result<Self, String> {
++        if pattern.len() > MAX_RESTORE_MATCH_PATTERN_BYTES {
++            return Err(format!(
++                "pattern exceeds {} bytes",
++                MAX_RESTORE_MATCH_PATTERN_BYTES
++            ));
++        }
++
++        let regex = RegexBuilder::new(&pattern)
++            .case_insensitive(true)
++            .size_limit(RESTORE_MATCH_REGEX_SIZE_LIMIT)
++            .dfa_size_limit(RESTORE_MATCH_REGEX_DFA_SIZE_LIMIT)
++            .build()
++            .map_err(|err| err.to_string())?;
++
++        Ok(Self {
++            pattern,
++            scope,
++            regex,
++        })
++    }
++
++    pub fn is_match(&self, title: &str) -> bool {
++        self.regex.is_match(title)
 +    }
 +}
 +
@@ -1039,19 +1416,29 @@ index 22c33f1..c055a81 100644
 +}
 +
  // TODO order?
-@@ -165,2 +255,6 @@ pub struct CaptureSources {
+ #[derive(Clone, Debug, Default)]
+ pub struct CaptureSources {
+     pub outputs: Vec<WlOutput>,
      pub toplevels: Vec<ExtForeignToplevelHandleV1>,
 +    /// Per-toplevel rescue mode (parallel with `toplevels`).
 +    pub rescue_modes: Vec<u32>,
 +    /// Per-toplevel title regex rescue rules (parallel with `toplevels`).
 +    pub rescue_match_rules: Vec<Vec<RestoreMatchRule>>,
  }
-@@ -175,2 +269,4 @@ impl CaptureSources {
+
+ impl CaptureSources {
+@@ -173,6 +301,8 @@ impl CaptureSources {
+     pub fn clear(&mut self) {
+         self.outputs.clear();
          self.toplevels.clear();
 +        self.rescue_modes.clear();
 +        self.rescue_match_rules.clear();
      }
-@@ -183,2 +279,7 @@ pub enum Msg {
+ }
+
+@@ -181,6 +311,11 @@ pub enum Msg {
+     ActivateTab(widget::segmented_button::Entity),
+     SelectOutput(WlOutput),
      SelectToplevel(ExtForeignToplevelHandleV1),
 +    SetRescueMode(ExtForeignToplevelHandleV1, u32),
 +    AddRescueAlias(ExtForeignToplevelHandleV1),
@@ -1059,13 +1446,17 @@ index 22c33f1..c055a81 100644
 +    SetRescueAliasPattern(ExtForeignToplevelHandleV1, usize, String),
 +    SetRescueAliasScope(ExtForeignToplevelHandleV1, usize, RestoreMatchScope),
      Share,
-@@ -223,2 +324,5 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+     Cancel,
+ }
+@@ -221,14 +356,93 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+                 .position(|t| t == &toplevel)
+             {
                  args.capture_sources.toplevels.remove(idx);
 +                args.capture_sources.rescue_modes.remove(idx);
 +                args.capture_sources.rescue_match_rules.remove(idx);
 +                args.rescue_mode_selections.remove(&toplevel);
              } else {
-@@ -226,4 +330,76 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+                 if !args.multiple && !args.capture_sources.is_empty() {
                      args.capture_sources.clear();
 +                    args.rescue_mode_selections.clear();
                  }
@@ -1142,15 +1533,19 @@ index 22c33f1..c055a81 100644
 +            {
 +                row.scope = scope;
              }
-@@ -231,2 +407,6 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+         }
          Msg::Share => {
 +            sync_capture_aliases(args);
 +            if args.capture_sources.is_empty() || has_invalid_aliases(args) {
 +                return cosmic::Task::none();
 +            }
              if let Some(mut args) = portal.screencast_args.take() {
-@@ -247,2 +427,155 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
- 
+                 let response = mem::take(&mut args.capture_sources);
+                 args.send_response(Some(response));
+@@ -245,6 +459,157 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+     cosmic::Task::none()
+ }
+
 +fn sync_capture_aliases(args: &mut Args) {
 +    args.capture_sources.rescue_match_rules.clear();
 +    for toplevel in &args.capture_sources.toplevels {
@@ -1174,18 +1569,17 @@ index 22c33f1..c055a81 100644
 +fn alias_rows_to_rules(rows: &[AliasEditorRow]) -> Result<Vec<RestoreMatchRule>, String> {
 +    let mut rules = Vec::new();
 +    for (idx, row) in rows.iter().enumerate() {
++        if rules.len() >= MAX_RESTORE_MATCH_RULES {
++            break;
++        }
 +        let pattern = row.pattern.trim();
 +        if pattern.is_empty() {
 +            continue;
 +        }
-+        RegexBuilder::new(pattern)
-+            .case_insensitive(true)
-+            .build()
-+            .map_err(|err| format!("rule {}: {}", idx + 1, err))?;
-+        rules.push(RestoreMatchRule {
-+            pattern: pattern.to_string(),
-+            scope: row.scope,
-+        });
++        rules.push(
++            RestoreMatchRule::new(pattern.to_string(), row.scope)
++                .map_err(|err| format!("rule {}: {}", idx + 1, err))?,
++        );
 +    }
 +    Ok(rules)
 +}
@@ -1193,6 +1587,9 @@ index 22c33f1..c055a81 100644
 +pub fn parse_alias_text(text: &str) -> Result<Vec<RestoreMatchRule>, String> {
 +    let mut rules = Vec::new();
 +    for (line_idx, line) in text.lines().enumerate() {
++        if rules.len() >= MAX_RESTORE_MATCH_RULES {
++            break;
++        }
 +        let line = line.trim();
 +        if line.is_empty() {
 +            continue;
@@ -1213,14 +1610,10 @@ index 22c33f1..c055a81 100644
 +        if pattern.is_empty() {
 +            continue;
 +        }
-+        RegexBuilder::new(pattern)
-+            .case_insensitive(true)
-+            .build()
-+            .map_err(|err| format!("line {}: {}", line_idx + 1, err))?;
-+        rules.push(RestoreMatchRule {
-+            pattern: pattern.to_string(),
-+            scope,
-+        });
++        rules.push(
++            RestoreMatchRule::new(pattern.to_string(), scope)
++                .map_err(|err| format!("line {}: {}", line_idx + 1, err))?,
++        );
 +    }
 +    Ok(rules)
 +}
@@ -1305,8 +1698,12 @@ index 22c33f1..c055a81 100644
 +}
 +
  pub fn update_args(portal: &mut CosmicPortal, args: Args) -> cosmic::Task<crate::app::Msg> {
-@@ -358,8 +691,13 @@ fn output_button<'a>(
- 
+     // If the dialog is already open, cancel previous request, but re-use dialog surface
+     let command = if let Some(args) = portal.screencast_args.take() {
+@@ -356,12 +721,17 @@ fn output_button<'a>(
+         .into()
+ }
+
 -fn toplevel_button(
 -    label: &str,
 +fn toplevel_button<'a>(
@@ -1323,7 +1720,11 @@ index 22c33f1..c055a81 100644
 +    toplevel: &ExtForeignToplevelHandleV1,
 +) -> cosmic::Element<'a, Msg> {
      let text = widget::text(label).class(theme::style::Text::Custom(|theme| {
-@@ -373,7 +711,5 @@ fn toplevel_button(
+         let container = theme.current_container();
+         cosmic::iced_core::widget::text::Style {
+@@ -371,9 +741,7 @@ fn toplevel_button(
+     let button = widget::button::custom(text)
+         .width(iced::Length::Fill)
          .padding(0)
 -        // TODO hover style? Etc.
 -        // .style(theme::style::Button::Text)
@@ -1332,11 +1733,11 @@ index 22c33f1..c055a81 100644
 -        .on_press(msg);
 +        .on_press(select_msg);
      let mut children = Vec::new();
-@@ -381,3 +717,2 @@ fn toplevel_button(
+@@ -381,9 +749,93 @@ fn toplevel_button(
      children.push(button.into());
 -    // TODO
      if is_selected {
-@@ -385,3 +720,88 @@ fn toplevel_button(
+         children.push(widget::text("✓").into());
      }
 -    widget::row::with_children(children).spacing(12).into()
 +    let row = widget::row::with_children(children).spacing(12);
@@ -1426,12 +1827,20 @@ index 22c33f1..c055a81 100644
 +
 +    widget::column::with_children(details).spacing(4).into()
  }
-@@ -397,3 +817,3 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+
+ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+@@ -395,7 +847,7 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+     let cancel_button = widget::button::standard(fl!("cancel")).on_press(Msg::Cancel);
+     let mut share_button =
          widget::button::standard(fl!("share")).class(cosmic::style::Button::Suggested);
 -    if !args.capture_sources.is_empty() {
 +    if !args.capture_sources.is_empty() && !has_invalid_aliases(args) {
          share_button = share_button.on_press(Msg::Share);
-@@ -424,6 +844,13 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+     }
+
+@@ -422,15 +874,27 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+             for (toplevel_info, icon) in &args.toplevels {
+                 let icon = IconSource::from_unknown(icon.as_deref().unwrap_or_default());
                  let label = &toplevel_info.title;
 -                let is_selected = args
 -                    .capture_sources
@@ -1449,7 +1858,7 @@ index 22c33f1..c055a81 100644
 +                let aliases_invalid =
 +                    alias_rows.is_some_and(|rows| alias_rows_to_rules(rows).is_err());
                  list = list.add(toplevel_button(
-@@ -431,4 +858,9 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+                     label,
                      is_selected,
 +                    has_app_id,
 +                    rescue_mode,
@@ -1460,7 +1869,11 @@ index 22c33f1..c055a81 100644
 +                    Msg::SelectToplevel(handle.clone()),
 +                    handle,
                  ));
-@@ -473 +905,48 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+             }
+             if args.toplevels.len() > 8 {
+@@ -471,3 +935,50 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+     .min_height(1.)
+     .into()
  }
 +
 +#[cfg(test)]
@@ -1510,35 +1923,57 @@ index 22c33f1..c055a81 100644
 +    }
 +}
 diff --git a/src/wayland/mod.rs b/src/wayland/mod.rs
-index 15a9536..02f3509 100644
+index a8447e9..9870b7c 100644
 --- a/src/wayland/mod.rs
 +++ b/src/wayland/mod.rs
-@@ -26,2 +26,5 @@ use std::{
- };
-+
-+use crate::screencast_dialog::CaptureSources;
+@@ -34,6 +34,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
+
+ pub use cosmic_client_toolkit::screencopy::{CaptureSource, Rect};
+
 +use crate::screencast::PersistedCaptureSources;
- use wayland_client::{
-@@ -83,2 +86,10 @@ impl DmabufHelper {
- 
++use crate::screencast_dialog::CaptureSources;
+ use crate::buffer;
+
+ mod gbm_devices;
+@@ -81,12 +84,26 @@ impl DmabufHelper {
+     }
+ }
+
 +const MAX_PENDING_RESCUES: usize = 64;
++
++pub enum RescueOutcome {
++    Sources(CaptureSources),
++    NeedsConsent,
++}
 +
 +/// A pending rescue waiting for a window to appear.
 +struct PendingRescue {
 +    persisted: PersistedCaptureSources,
-+    sender: tokio::sync::oneshot::Sender<CaptureSources>,
++    sender: tokio::sync::oneshot::Sender<RescueOutcome>,
 +}
 +
  struct WaylandHelperInner {
-@@ -89,2 +100,3 @@ struct WaylandHelperInner {
+     conn: wayland_client::Connection,
+     outputs: Mutex<Vec<wl_output::WlOutput>>,
+     output_infos: Mutex<HashMap<wl_output::WlOutput, OutputInfo>>,
+     output_toplevels: Mutex<HashMap<wl_output::WlOutput, Vec<ExtForeignToplevelHandleV1>>>,
      toplevels: Mutex<Vec<ToplevelInfo>>,
 +    pending_rescues: Mutex<Vec<PendingRescue>>,
      qh: QueueHandle<AppData>,
-@@ -154,2 +166,22 @@ impl AppData {
+     capturer: Capturer,
+     wl_shm: wl_shm::WlShm,
+@@ -152,6 +169,38 @@ impl AppData {
+
+         *self.wayland_helper.inner.toplevels.lock().unwrap() =
              self.toplevel_info_state.toplevels().cloned().collect();
 +
 +        // Check all pending rescues against current toplevels.
-+        // drain → check each → push back the ones still waiting.
++        // Snapshot toplevels before locking pending_rescues so every path uses
++        // the global toplevels -> pending_rescues order and never re-locks
++        // toplevels while a rescue drain is active.
++        let toplevel_snapshot = self.wayland_helper.inner.toplevels.lock().unwrap().clone();
++
++        // drain -> check each -> push back the ones still waiting.
 +        let mut rescues = self.wayland_helper.inner.pending_rescues.lock().unwrap();
 +        let pending: Vec<PendingRescue> = rescues.drain(..).collect();
 +        for rescue in pending {
@@ -1548,8 +1983,15 @@ index 15a9536..02f3509 100644
 +            }
 +
 +            // Try matching against current toplevels
-+            if let Some(sources) = rescue.persisted.to_capture_sources(&self.wayland_helper) {
-+                let _ = rescue.sender.send(sources);
++            if let Some(sources) = rescue
++                .persisted
++                .to_capture_sources_with(&toplevel_snapshot, &self.wayland_helper)
++            {
++                let _ = rescue.sender.send(RescueOutcome::Sources(sources));
++                continue;
++            }
++            if rescue.persisted.needs_consent_with(&toplevel_snapshot) {
++                let _ = rescue.sender.send(RescueOutcome::NeedsConsent);
 +                continue;
 +            }
 +
@@ -1557,12 +1999,20 @@ index 15a9536..02f3509 100644
 +            rescues.push(rescue);
 +        }
      }
-@@ -247,2 +279,3 @@ impl WaylandHelper {
+ }
+
+@@ -254,6 +303,7 @@ impl WaylandHelper {
+                 output_infos: Mutex::new(HashMap::new()),
+                 output_toplevels: Mutex::new(HashMap::new()),
                  toplevels: Mutex::new(Vec::new()),
 +                pending_rescues: Mutex::new(Vec::new()),
                  qh: qh.clone(),
-@@ -294,2 +327,33 @@ impl WaylandHelper {
- 
+                 capturer: screencopy_state.capturer().clone(),
+                 wl_shm: shm_state.wl_shm().clone(),
+@@ -301,6 +351,41 @@ impl WaylandHelper {
+         self.inner.toplevels.lock().unwrap().clone()
+     }
+
 +    /// Atomically check if persisted sources can be resolved against current
 +    /// toplevels. If not, register a rescue hook in the same lock scope.
 +    /// Returns `Ok(sources)` on immediate match, `Err(Some(rx))` if rescue
@@ -1570,12 +2020,16 @@ index 15a9536..02f3509 100644
 +    pub fn check_or_rescue(
 +        &self,
 +        persisted: &PersistedCaptureSources,
-+    ) -> Result<CaptureSources, Option<tokio::sync::oneshot::Receiver<CaptureSources>>> {
-+        // Lock order: toplevels → pending_rescues (matches update_output_toplevels)
++    ) -> Result<RescueOutcome, Option<tokio::sync::oneshot::Receiver<RescueOutcome>>> {
++        // Lock order: toplevels -> pending_rescues. update_output_toplevels
++        // snapshots toplevels before taking pending_rescues, matching this order.
 +        let toplevel_list = self.inner.toplevels.lock().unwrap();
 +
 +        if let Some(sources) = persisted.to_capture_sources_with(&toplevel_list, self) {
-+            return Ok(sources);
++            return Ok(RescueOutcome::Sources(sources));
++        }
++        if persisted.needs_consent_with(&toplevel_list) {
++            return Ok(RescueOutcome::NeedsConsent);
 +        }
 +
 +        let mut rescues = self.inner.pending_rescues.lock().unwrap();
@@ -1595,6 +2049,7 @@ index 15a9536..02f3509 100644
 +    }
 +
      pub fn output_info(&self, output: &wl_output::WlOutput) -> Option<OutputInfo> {
--- 
-2.53.0
-
+         self.inner.output_infos.lock().unwrap().get(output).cloned()
+     }
+--
+2.54.0
