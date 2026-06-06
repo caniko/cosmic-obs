@@ -1,12 +1,22 @@
 From 416ca9e53fd5ca99698f786e7bb11ca263686ae9 Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Thu, 23 Apr 2026 10:46:51 +0200
-Subject: [PATCH] linux-pipewire: send restore match rules
+Subject: [PATCH] linux-pipewire: send restore metadata to portal
+
+Read RestorePolicyAction unconditionally on both create and update. OBS
+registers its default before source instances are created, so upgraded sources
+without a saved user value resolve through obs_data_get_int() to the registered
+Skip default instead of falling through to Prompt.
+
+Send restore_match_rules only with a restore_token, matching restore_policy's
+restore-only behavior and keeping fresh selections behaviorally unchanged.
+
+Signed-off-by: Can H. Tartanoglu <gpg@rotas.mozmail.com>
 
 ---
  plugins/linux-pipewire/data/locale/en-US.ini |   6 +
- plugins/linux-pipewire/screencast-portal.c   | 130 ++++++++++++++++++-
- 2 files changed, 134 insertions(+), 2 deletions(-)
+ plugins/linux-pipewire/screencast-portal.c   | 124 ++++++++++++++++++-
+ 2 files changed, 128 insertions(+), 2 deletions(-)
 
 diff --git a/plugins/linux-pipewire/data/locale/en-US.ini b/plugins/linux-pipewire/data/locale/en-US.ini
 index a7eedd1..52538da 100644
@@ -19,7 +29,7 @@ index a7eedd1..52538da 100644
 +RestorePolicyAction.Skip="Skip silently"
 +RestorePolicyAction.Error="Report error"
 +RestoreMatchRules="Restore title aliases (regex, one per line)"
-+RestoreMatchRules.ToolTip="One Rust regex per line. Rules are searched case-insensitively within window titles. Rules default to same_app; prefix a line with any: or any_app: to match across app IDs. Rust regex does not support lookaround or backreferences."
++RestoreMatchRules.ToolTip="One Rust regex per line. Rules are searched case-insensitively within window titles. Rules default to same_app; prefix a line with same:, same_app:, any:, or any_app:. Rust regex does not support lookaround or backreferences."
  VideoFormat="Video Format"
 diff --git a/plugins/linux-pipewire/screencast-portal.c b/plugins/linux-pipewire/screencast-portal.c
 index d5fe531..b00e463 100644
@@ -138,43 +148,37 @@ index d5fe531..b00e463 100644
 +					      g_variant_new_uint32(capture->restore_action));
 +			g_variant_builder_add(&builder, "{sv}", "restore_policy",
 +					      g_variant_builder_end(&policy));
-+		}
 +
-+		add_restore_match_rules(&builder, capture->restore_match_rules);
++			add_restore_match_rules(&builder, capture->restore_match_rules);
++		}
 +	}
 +
  	g_dbus_proxy_call(get_screencast_portal_proxy(), "SelectSources",
-@@ -519,2 +616,6 @@ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_
+@@ -519,2 +616,4 @@ static void *screencast_portal_desktop_capture_create(obs_data_t *settings, obs_
  	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
-+	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
-+					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
-+					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
++	capture->restore_action = (uint32_t)obs_data_get_int(settings, "RestorePolicyAction");
 +	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  	capture->source = source;
-@@ -533,2 +634,6 @@ static void *screencast_portal_window_capture_create(obs_data_t *settings, obs_s
+@@ -533,2 +632,4 @@ static void *screencast_portal_window_capture_create(obs_data_t *settings, obs_s
  	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
-+	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
-+					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
-+					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
++	capture->restore_action = (uint32_t)obs_data_get_int(settings, "RestorePolicyAction");
 +	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  	capture->source = source;
-@@ -548,2 +653,6 @@ static void *screencast_portal_capture_create(obs_data_t *settings, obs_source_t
+@@ -548,2 +649,4 @@ static void *screencast_portal_capture_create(obs_data_t *settings, obs_source_t
  	capture->restore_token = bstrdup(obs_data_get_string(settings, "RestoreToken"));
-+	capture->restore_action = obs_data_has_user_value(settings, "RestorePolicyAction")
-+					  ? (uint32_t)obs_data_get_int(settings, "RestorePolicyAction")
-+					  : (uint32_t)obs_data_get_int(settings, "RestoreFailMode");
++	capture->restore_action = (uint32_t)obs_data_get_int(settings, "RestorePolicyAction");
 +	capture->restore_match_rules = bstrdup(obs_data_get_string(settings, "RestoreMatchRules"));
  	capture->source = source;
-@@ -571,2 +680,3 @@ static void screencast_portal_capture_destroy(void *data)
+@@ -571,2 +674,3 @@ static void screencast_portal_capture_destroy(void *data)
  	g_clear_pointer(&capture->restore_token, bfree);
 +	g_clear_pointer(&capture->restore_match_rules, bfree);
  
-@@ -590,2 +700,4 @@ static void screencast_portal_capture_get_defaults(obs_data_t *settings)
+@@ -590,2 +694,4 @@ static void screencast_portal_capture_get_defaults(obs_data_t *settings)
  	obs_data_set_default_string(settings, "RestoreToken", NULL);
 +	obs_data_set_default_int(settings, "RestorePolicyAction", 1);
 +	obs_data_set_default_string(settings, "RestoreMatchRules", NULL);
  }
-@@ -616,2 +728,13 @@ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
+@@ -616,2 +722,13 @@ static obs_properties_t *screencast_portal_capture_get_properties(void *data)
  
 +	obs_property_t *mode_prop = obs_properties_add_list(properties, "RestorePolicyAction",
 +							    obs_module_text("RestorePolicyAction"), OBS_COMBO_TYPE_LIST,
@@ -188,7 +192,7 @@ index d5fe531..b00e463 100644
 +	obs_property_set_long_description(rules_prop, obs_module_text("RestoreMatchRules.ToolTip"));
 +
  	return properties;
-@@ -624,2 +747,5 @@ static void screencast_portal_capture_update(void *data, obs_data_t *settings)
+@@ -624,2 +741,5 @@ static void screencast_portal_capture_update(void *data, obs_data_t *settings)
  	capture->cursor_visible = obs_data_get_bool(settings, "ShowCursor");
 +	capture->restore_action = (uint32_t)obs_data_get_int(settings, "RestorePolicyAction");
 +	g_clear_pointer(&capture->restore_match_rules, bfree);
@@ -196,4 +200,3 @@ index d5fe531..b00e463 100644
  
 -- 
 2.53.0
-
