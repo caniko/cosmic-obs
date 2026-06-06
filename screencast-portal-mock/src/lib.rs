@@ -5,7 +5,7 @@
 //! for later assertion.
 //!
 //! Designed for testing portal clients against the ScreenCast RFC v6 extensions:
-//! `source_label` and `restore_policy`.
+//! `source_label`, `restore_policy`, and `restore_match_rules`.
 //!
 //! # Usage
 //!
@@ -31,8 +31,10 @@ pub use bus::PrivateBus;
 pub use handle::MockPortalHandle;
 pub use portal::MockPortal;
 pub use records::{
-    Call, RestoreAction, RestoreFailReason, RestoreFailure, RestorePolicy, SourceDef, SourceTypes,
-    parse_restore_policy, restore_failure_value,
+    ACCEPTED_SELECT_SOURCES_KEYS, Call, RestoreAction, RestoreFailReason, RestoreFailure,
+    RestoreMatchRule, RestoreMatchScope, RestorePolicy, RestoreTokenRecord, SourceDef, SourceTypes,
+    parse_restore_match_rules, parse_restore_policy, restore_failure_value,
+    restore_match_rules_value,
 };
 pub use scenario::{
     DelayedRestore, ErrorWithoutFlag, ExternallyTriggeredRescue, FailThenSucceed, MultiSource,

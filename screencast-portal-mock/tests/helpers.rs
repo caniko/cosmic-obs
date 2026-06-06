@@ -135,6 +135,33 @@ pub async fn start_session(
     recv_response_for(&mut stream, &request_path).await
 }
 
+/// Call `Start`, wait for Response, then wait for Session::Closed.
+pub async fn start_session_and_wait_closed(
+    client: &zbus::Connection,
+    session_handle: &OwnedObjectPath,
+) -> (u32, HashMap<String, OwnedValue>) {
+    let response_rule = response_match_rule();
+    let mut response_stream = zbus::MessageStream::for_match_rule(response_rule, client, Some(64))
+        .await
+        .expect("create response message stream");
+
+    let closed_rule = session_closed_match_rule();
+    let mut closed_stream = zbus::MessageStream::for_match_rule(closed_rule, client, Some(64))
+        .await
+        .expect("create session closed message stream");
+
+    let proxy = screencast_proxy(client).await;
+    let options: HashMap<String, OwnedValue> = HashMap::new();
+    let request_path: OwnedObjectPath = proxy
+        .call("Start", &(session_handle.clone(), String::new(), options))
+        .await
+        .expect("Start call");
+
+    let response = recv_response_for(&mut response_stream, &request_path).await;
+    recv_session_closed_for(&mut closed_stream, session_handle).await;
+    response
+}
+
 /// Call `Start` and return the expected D-Bus error.
 pub async fn start_session_error(
     client: &zbus::Connection,
@@ -228,6 +255,50 @@ pub fn restore_failure_token_invalid(failure: &HashMap<String, OwnedValue>) -> b
             .expect("restore_failure.token_invalid should be present"),
     )
     .expect("restore_failure.token_invalid should be bool")
+}
+
+pub fn streams(results: &HashMap<String, OwnedValue>) -> Vec<(u32, HashMap<String, OwnedValue>)> {
+    let value = results.get("streams").expect("streams should be present");
+    let raw: Vec<OwnedValue> = value.clone().try_into().expect("streams should be av");
+    raw.into_iter()
+        .map(|stream| {
+            let (node_id, props): (OwnedValue, OwnedValue) =
+                stream.try_into().expect("stream should be (vv)");
+            let node_id = u32::try_from(unvariant(node_id)).expect("stream node id should be u32");
+            let props: Vec<OwnedValue> = unvariant(props)
+                .try_into()
+                .expect("stream props should be av");
+            let props = props
+                .into_iter()
+                .map(|prop| {
+                    let (key, value): (OwnedValue, OwnedValue) =
+                        prop.try_into().expect("stream prop should be (vv)");
+                    let key = unvariant(key)
+                        .downcast_ref::<Str<'_>>()
+                        .expect("stream prop key should be string")
+                        .to_string();
+                    (key, unvariant(value))
+                })
+                .collect();
+            (node_id, props)
+        })
+        .collect()
+}
+
+fn unvariant(value: OwnedValue) -> OwnedValue {
+    match Value::from(value) {
+        Value::Value(inner) => OwnedValue::try_from(*inner).expect("variant should be ownable"),
+        other => OwnedValue::try_from(other).expect("value should be ownable"),
+    }
+}
+
+pub fn string_prop(props: &HashMap<String, OwnedValue>, key: &str) -> String {
+    props
+        .get(key)
+        .unwrap_or_else(|| panic!("{key} should be present"))
+        .downcast_ref::<Str<'_>>()
+        .unwrap_or_else(|_| panic!("{key} should be string"))
+        .to_string()
 }
 
 async fn screencast_proxy(client: &zbus::Connection) -> zbus::Proxy<'_> {

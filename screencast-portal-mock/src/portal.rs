@@ -6,7 +6,8 @@ use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::records::{
-    Call, RestoreAction, RestorePolicy, SourceTypes, parse_restore_policy, restore_failure_value,
+    Call, RestoreAction, RestoreFailReason, RestorePolicy, SourceTypes, parse_restore_match_rules,
+    parse_restore_policy, restore_failure_value,
 };
 use crate::scenario::Scenario;
 
@@ -60,6 +61,7 @@ pub struct ScreenCastPortal {
     scenario: Arc<dyn Scenario>,
     calls: Arc<Mutex<Vec<Call>>>,
     closed_sessions: Arc<Mutex<HashSet<String>>>,
+    pending_source_unavailable: Arc<Mutex<HashMap<String, RestoreAction>>>,
     conn: zbus::Connection,
     counter: Arc<AtomicU64>,
 }
@@ -70,6 +72,7 @@ impl ScreenCastPortal {
         scenario: Arc<dyn Scenario>,
         calls: Arc<Mutex<Vec<Call>>>,
         closed_sessions: Arc<Mutex<HashSet<String>>>,
+        pending_source_unavailable: Arc<Mutex<HashMap<String, RestoreAction>>>,
         conn: zbus::Connection,
         counter: Arc<AtomicU64>,
     ) -> Self {
@@ -77,6 +80,7 @@ impl ScreenCastPortal {
             scenario,
             calls,
             closed_sessions,
+            pending_source_unavailable,
             conn,
             counter,
         }
@@ -177,6 +181,11 @@ impl ScreenCastPortal {
             .map(parse_restore_policy)
             .transpose()
             .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
+        let restore_match_rules = options
+            .get("restore_match_rules")
+            .map(parse_restore_match_rules)
+            .transpose()
+            .map_err(|e| zbus::fdo::Error::InvalidArgs(e.to_string()))?;
         let had_restore_token = restore_token.is_some();
 
         if self
@@ -198,6 +207,7 @@ impl ScreenCastPortal {
             restore_token,
             source_label,
             restore_policy: restore_policy.clone(),
+            restore_match_rules,
             raw_options: options.clone(),
         };
 
@@ -208,6 +218,7 @@ impl ScreenCastPortal {
         let rp = request_path.clone();
         let sp = session_handle.clone();
         let closed_sessions = self.closed_sessions.clone();
+        let pending_source_unavailable = self.pending_source_unavailable.clone();
         let policy = restore_policy.unwrap_or_else(RestorePolicy::default);
 
         conn.object_server()
@@ -222,6 +233,18 @@ impl ScreenCastPortal {
                     fire_response(&conn, &rp, 0, extra).await;
                 }
                 Err(failure) => {
+                    if failure.reason == RestoreFailReason::SourceUnavailable {
+                        if had_restore_token {
+                            let action = policy.action_for(failure.reason);
+                            pending_source_unavailable
+                                .lock()
+                                .expect("pending_source_unavailable mutex poisoned")
+                                .insert(sp.as_str().to_owned(), action);
+                        }
+                        fire_response(&conn, &rp, 0, HashMap::new()).await;
+                        return;
+                    }
+
                     let action = if had_restore_token {
                         policy.action_for(failure.reason)
                     } else {
@@ -282,6 +305,9 @@ impl ScreenCastPortal {
         let conn = self.conn.clone();
         let scenario = self.scenario.clone();
         let rp = request_path.clone();
+        let sp = session_handle.clone();
+        let closed_sessions = self.closed_sessions.clone();
+        let pending_source_unavailable = self.pending_source_unavailable.clone();
 
         conn.object_server()
             .at(&request_path, RequestObject)
@@ -289,6 +315,40 @@ impl ScreenCastPortal {
             .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
 
         tokio::spawn(async move {
+            let source_unavailable_action = pending_source_unavailable
+                .lock()
+                .expect("pending_source_unavailable mutex poisoned")
+                .remove(sp.as_str());
+
+            if let Some(action) = source_unavailable_action {
+                match action {
+                    RestoreAction::Prompt => {
+                        let start_result = scenario.on_start(&options).await;
+                        fire_response(&conn, &rp, start_result.response, start_result.results)
+                            .await;
+                    }
+                    RestoreAction::Skip => {
+                        fire_response(&conn, &rp, 1, HashMap::new()).await;
+                        mark_session_closed(&closed_sessions, &sp);
+                        fire_session_closed(&conn, &sp).await;
+                    }
+                    RestoreAction::Error => {
+                        let mut results = HashMap::new();
+                        results.insert(
+                            "restore_failure".into(),
+                            restore_failure_value(
+                                RestoreFailReason::SourceUnavailable,
+                                RestoreAction::Error,
+                            ),
+                        );
+                        fire_response(&conn, &rp, 2, results).await;
+                        mark_session_closed(&closed_sessions, &sp);
+                        fire_session_closed(&conn, &sp).await;
+                    }
+                }
+                return;
+            }
+
             let start_result = scenario.on_start(&options).await;
             fire_response(&conn, &rp, start_result.response, start_result.results).await;
         });
@@ -384,6 +444,8 @@ impl MockPortal {
 
         let calls: Arc<Mutex<Vec<Call>>> = Arc::new(Mutex::new(Vec::new()));
         let closed_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let pending_source_unavailable: Arc<Mutex<HashMap<String, RestoreAction>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let counter = Arc::new(AtomicU64::new(0));
         let scenario: Arc<dyn Scenario> = Arc::new(scenario);
 
@@ -391,6 +453,7 @@ impl MockPortal {
             scenario.clone(),
             calls.clone(),
             closed_sessions,
+            pending_source_unavailable,
             conn.clone(),
             counter.clone(),
         );

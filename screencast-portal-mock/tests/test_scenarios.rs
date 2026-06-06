@@ -82,6 +82,49 @@ async fn multi_source_stream_count() {
 }
 
 #[tokio::test]
+async fn source_def_label_is_emitted_in_stream_properties() {
+    let scenario = MultiSource {
+        sources: vec![SourceDef::monitor(7).with_label("OBS Camera")],
+    };
+    let (_bus, _handle, client) = helpers::setup(scenario).await;
+
+    let session = helpers::create_session(&client).await;
+    let (resp, _) = helpers::select_sources(&client, &session, Default::default()).await;
+    assert_eq!(resp, 0);
+
+    let (resp, results) = helpers::start_session(&client, &session).await;
+    assert_eq!(resp, 0);
+    let streams = helpers::streams(&results);
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].0, 7);
+    assert_eq!(
+        helpers::string_prop(&streams[0].1, "source_label"),
+        "OBS Camera"
+    );
+}
+
+#[tokio::test]
+async fn invalid_source_def_fails_restore_at_start() {
+    let scenario = MultiSource {
+        sources: vec![SourceDef::monitor(7).invalid()],
+    };
+    let (_bus, _handle, client) = helpers::setup(scenario).await;
+
+    let session = helpers::create_session(&client).await;
+    let (resp, _) = helpers::select_sources(&client, &session, Default::default()).await;
+    assert_eq!(resp, 0);
+
+    let (resp, results) = helpers::start_session(&client, &session).await;
+    assert_eq!(resp, 2);
+    let failure = helpers::restore_failure(&results);
+    assert_eq!(
+        helpers::restore_failure_reason(&failure),
+        "source_unavailable"
+    );
+    assert!(!helpers::restore_failure_token_invalid(&failure));
+}
+
+#[tokio::test]
 async fn restore_token_valid() {
     let scenario = RestoreTokenValid {
         token: "test-token-42".to_string(),

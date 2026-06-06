@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use zbus::zvariant::OwnedValue;
 
-use crate::records::{RestoreFailReason, RestoreFailure, SourceDef};
+use crate::records::{
+    RestoreAction, RestoreFailReason, RestoreFailure, SourceDef, restore_failure_value,
+};
 
 /// Convenience alias for the options vardict.
 pub type Options = HashMap<String, OwnedValue>;
@@ -65,7 +67,7 @@ pub fn encode_streams(sources: &[SourceDef]) -> OwnedValue {
     let entries: Vec<Value<'_>> = sources
         .iter()
         .map(|s| {
-            let props: Vec<Value<'_>> = vec![
+            let mut props: Vec<Value<'_>> = vec![
                 Value::new(zbus::zvariant::Structure::from((
                     Value::new("source_type".to_string()),
                     Value::new(zbus::zvariant::Value::U32(1)),
@@ -82,6 +84,12 @@ pub fn encode_streams(sources: &[SourceDef]) -> OwnedValue {
                     Value::new(zbus::zvariant::Value::new((s.position.0, s.position.1))),
                 ))),
             ];
+            if let Some(label) = &s.expected_label {
+                props.push(Value::new(zbus::zvariant::Structure::from((
+                    Value::new("source_label".to_string()),
+                    Value::new(label.clone()),
+                ))));
+            }
 
             Value::new(zbus::zvariant::Structure::from((
                 Value::U32(s.node_id),
@@ -158,6 +166,18 @@ pub struct MultiSource {
 #[async_trait]
 impl Scenario for MultiSource {
     async fn on_start(&self, _options: &Options) -> StartResult {
+        if self.sources.iter().any(|source| !source.restore_valid) {
+            let mut results = HashMap::new();
+            results.insert(
+                "restore_failure".into(),
+                restore_failure_value(RestoreFailReason::SourceUnavailable, RestoreAction::Error),
+            );
+            return StartResult {
+                response: 2,
+                results,
+            };
+        }
+
         let streams = encode_streams(&self.sources);
         let mut results = HashMap::new();
         results.insert("streams".into(), streams);

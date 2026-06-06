@@ -2,7 +2,19 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use bitflags::bitflags;
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+use zbus::zvariant::{Dict, OwnedObjectPath, OwnedValue, Type, Value};
+
+/// SelectSources option keys accepted by the v6 mock.
+pub const ACCEPTED_SELECT_SOURCES_KEYS: &[&str] = &[
+    "types",
+    "multiple",
+    "cursor_mode",
+    "restore_token",
+    "persist_mode",
+    "source_label",
+    "restore_policy",
+    "restore_match_rules",
+];
 
 /// Reason a restore token could not be honoured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -176,6 +188,167 @@ pub fn restore_failure_value(reason: RestoreFailReason, action: RestoreAction) -
     OwnedValue::from(failure)
 }
 
+/// Scope for a title-regex restore match rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMatchScope {
+    SameApp,
+    AnyApp,
+}
+
+impl RestoreMatchScope {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameApp => "same_app",
+            Self::AnyApp => "any_app",
+        }
+    }
+}
+
+impl TryFrom<&str> for RestoreMatchScope {
+    type Error = InvalidRestoreMatchRules;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "same_app" | "same" => Ok(Self::SameApp),
+            "any_app" | "any" => Ok(Self::AnyApp),
+            other => Err(InvalidRestoreMatchRules::InvalidScope(other.to_string())),
+        }
+    }
+}
+
+/// Parsed `restore_match_rules` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreMatchRule {
+    pub kind: String,
+    pub pattern: String,
+    pub scope: RestoreMatchScope,
+}
+
+impl RestoreMatchRule {
+    #[must_use]
+    pub fn title_regex(pattern: impl Into<String>, scope: RestoreMatchScope) -> Self {
+        Self {
+            kind: "title_regex".to_string(),
+            pattern: pattern.into(),
+            scope,
+        }
+    }
+}
+
+/// Error returned when the `restore_match_rules` shape is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidRestoreMatchRules {
+    #[error("restore_match_rules must be an aa{{sv}} array of vardicts")]
+    NotArrayOfVardicts,
+    #[error("restore_match_rules[{0}].kind must be string")]
+    InvalidKind(usize),
+    #[error("restore_match_rules[{0}].pattern must be string")]
+    InvalidPattern(usize),
+    #[error("restore_match_rules[{0}].scope must be string")]
+    InvalidScopeType(usize),
+    #[error("restore_match_rules scope must be same_app or any_app, got {0}")]
+    InvalidScope(String),
+}
+
+/// Parse the standardized `restore_match_rules: aa{sv}` object.
+pub fn parse_restore_match_rules(
+    value: &OwnedValue,
+) -> Result<Vec<RestoreMatchRule>, InvalidRestoreMatchRules> {
+    let rules: Vec<HashMap<String, OwnedValue>> = value
+        .clone()
+        .try_into()
+        .map_err(|_| InvalidRestoreMatchRules::NotArrayOfVardicts)?;
+
+    rules
+        .into_iter()
+        .enumerate()
+        .map(|(idx, rule)| {
+            let kind =
+                string_field(&rule, "kind").ok_or(InvalidRestoreMatchRules::InvalidKind(idx))?;
+            let pattern = string_field(&rule, "pattern")
+                .ok_or(InvalidRestoreMatchRules::InvalidPattern(idx))?;
+            let scope = match rule.get("scope") {
+                Some(value) => string_from_value(value)
+                    .ok_or(InvalidRestoreMatchRules::InvalidScopeType(idx))
+                    .and_then(|scope| RestoreMatchScope::try_from(scope.as_str()))?,
+                None => RestoreMatchScope::SameApp,
+            };
+            Ok(RestoreMatchRule {
+                kind,
+                pattern,
+                scope,
+            })
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn restore_match_rules_value(rules: &[RestoreMatchRule]) -> OwnedValue {
+    let encoded: Vec<Value<'_>> = rules
+        .iter()
+        .map(|rule| {
+            let mut entry = Dict::new(<&str>::SIGNATURE, Value::SIGNATURE);
+            entry
+                .add("kind", Value::new(rule.kind.clone()))
+                .expect("kind entry has a{sv} signature");
+            entry
+                .add("pattern", Value::new(rule.pattern.clone()))
+                .expect("pattern entry has a{sv} signature");
+            entry
+                .add("scope", Value::new(rule.scope.as_str().to_string()))
+                .expect("scope entry has a{sv} signature");
+            Value::Dict(entry)
+        })
+        .collect();
+    OwnedValue::try_from(Value::new(encoded)).expect("restore_match_rules encoding is infallible")
+}
+
+fn string_field(rule: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
+    rule.get(key).and_then(string_from_value)
+}
+
+fn string_from_value(value: &OwnedValue) -> Option<String> {
+    value
+        .downcast_ref::<zbus::zvariant::Str<'_>>()
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// Minimal mock representation of COSMIC restore-token compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreTokenRecord {
+    pub version: u32,
+    pub restore_match_rules: Vec<Vec<RestoreMatchRule>>,
+}
+
+impl RestoreTokenRecord {
+    #[must_use]
+    pub fn legacy_v1(source_count: usize) -> Self {
+        Self::legacy_with_empty_rules(1, source_count)
+    }
+
+    #[must_use]
+    pub fn legacy_v2(source_count: usize) -> Self {
+        Self::legacy_with_empty_rules(2, source_count)
+    }
+
+    #[must_use]
+    pub fn v3(restore_match_rules: Vec<Vec<RestoreMatchRule>>) -> Self {
+        Self {
+            version: 3,
+            restore_match_rules,
+        }
+    }
+
+    fn legacy_with_empty_rules(version: u32, source_count: usize) -> Self {
+        Self {
+            version,
+            restore_match_rules: vec![Vec::new(); source_count],
+        }
+    }
+}
+
 bitflags! {
     /// Source type flags for `SelectSources`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +371,7 @@ pub struct Call {
     pub restore_token: Option<String>,
     pub source_label: Option<String>,
     pub restore_policy: Option<RestorePolicy>,
+    pub restore_match_rules: Option<Vec<RestoreMatchRule>>,
     pub raw_options: HashMap<String, OwnedValue>,
 }
 

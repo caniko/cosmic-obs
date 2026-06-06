@@ -93,7 +93,17 @@ async fn source_unavailable_failure_marks_token_valid() {
     let session = helpers::create_session(&client).await;
 
     let (resp, results) = helpers::select_sources(&client, &session, policy_options(2)).await;
-    assert_eq!(resp, 2);
+    assert_eq!(
+        resp, 0,
+        "source_unavailable should not surface at SelectSources"
+    );
+    assert!(
+        !results.contains_key("restore_failure"),
+        "SelectSources should not carry source_unavailable details"
+    );
+
+    let (resp, results) = helpers::start_session_and_wait_closed(&client, &session).await;
+    assert_eq!(resp, 2, "source_unavailable error should surface at Start");
 
     let failure = helpers::restore_failure(&results);
     assert_eq!(
@@ -201,7 +211,6 @@ async fn label_with_restore_policy() {
 async fn all_fail_reasons_with_error_policy() {
     let reasons = [
         RestoreFailReason::TokenNotFound,
-        RestoreFailReason::SourceUnavailable,
         RestoreFailReason::PermissionRevoked,
         RestoreFailReason::TokenConsumed,
     ];
@@ -222,4 +231,33 @@ async fn all_fail_reasons_with_error_policy() {
 
         handle.assert_call_count(1);
     }
+}
+
+#[tokio::test]
+async fn source_unavailable_skip_surfaces_at_start_without_failure_object() {
+    let scenario = RestoreTokenFails {
+        reason: RestoreFailReason::SourceUnavailable,
+    };
+    let (_bus, handle, client) = helpers::setup(scenario).await;
+    let session = helpers::create_session(&client).await;
+
+    let (resp, results) = helpers::select_sources(&client, &session, policy_options(1)).await;
+    assert_eq!(
+        resp, 0,
+        "source_unavailable skip should allow caller to enter Start"
+    );
+    assert!(
+        !results.contains_key("restore_failure"),
+        "source_unavailable must not be reported at SelectSources"
+    );
+
+    let (resp, results) = helpers::start_session_and_wait_closed(&client, &session).await;
+    assert_eq!(resp, 1, "source_unavailable skip should cancel at Start");
+    assert!(
+        !results.contains_key("restore_failure"),
+        "Start skip should not carry restore_failure"
+    );
+
+    handle.assert_call_count(1);
+    handle.assert_restore_default_action(0, RestoreAction::Skip);
 }

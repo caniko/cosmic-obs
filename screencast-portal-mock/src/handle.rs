@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tokio::task::JoinHandle;
 
-use crate::records::{Call, RestoreAction, RestoreFailReason};
+use crate::records::{Call, RestoreAction, RestoreFailReason, RestoreMatchRule};
 
 /// Errors from waiting on mock portal state.
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +134,34 @@ impl MockPortalHandle {
             call.restore_policy.is_none(),
             "call[{index}] expected no restore_policy, got {:?}",
             call.restore_policy
+        );
+    }
+
+    /// Assert that call at `index` has the given `restore_match_rules`.
+    ///
+    /// # Panics
+    /// Panics if the rules do not match.
+    pub fn assert_restore_match_rules(&self, index: usize, expected: &[RestoreMatchRule]) {
+        let calls = self.calls.lock().expect("calls mutex poisoned");
+        let call = &calls[index];
+        assert_eq!(
+            call.restore_match_rules.as_deref(),
+            Some(expected),
+            "call[{index}] restore_match_rules mismatch"
+        );
+    }
+
+    /// Assert that call at `index` has no `restore_match_rules`.
+    ///
+    /// # Panics
+    /// Panics if any rules are present.
+    pub fn assert_no_restore_match_rules(&self, index: usize) {
+        let calls = self.calls.lock().expect("calls mutex poisoned");
+        let call = &calls[index];
+        assert!(
+            call.restore_match_rules.is_none(),
+            "call[{index}] expected no restore_match_rules, got {:?}",
+            call.restore_match_rules
         );
     }
 
