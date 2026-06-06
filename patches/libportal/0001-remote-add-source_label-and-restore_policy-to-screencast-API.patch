@@ -1,15 +1,16 @@
-From 3a8f303d238cb752227a5351a3ab842234062bcb Mon Sep 17 00:00:00 2001
-From: agent <agent@local>
+From 12f9d089eb35f7a8f389825dc979782a6d098356 Mon Sep 17 00:00:00 2001
+From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Thu, 23 Apr 2026 10:46:51 +0200
 Subject: [PATCH] remote: add source_label and restore_policy to screencast API
 
+Signed-off-by: Can H. Tartanoglu <gpg@rotas.mozmail.com>
 ---
- libportal/remote.c | 289 +++++++++++++++++++++++++++++++++++++++++++--
- libportal/remote.h |  55 +++++++++
- 2 files changed, 332 insertions(+), 12 deletions(-)
+ libportal/remote.c | 342 +++++++++++++++++++++++++++++++++++++++++++--
+ libportal/remote.h |  67 +++++++++
+ 2 files changed, 396 insertions(+), 13 deletions(-)
 
 diff --git a/libportal/remote.c b/libportal/remote.c
-index a0da823..960dfb2 100644
+index a0da823..cb5b8ac 100644
 --- a/libportal/remote.c
 +++ b/libportal/remote.c
 @@ -34,6 +34,8 @@ typedef struct {
@@ -30,7 +31,7 @@ index a0da823..960dfb2 100644
  
    g_object_unref (call->portal);
    g_object_unref (call->task);
-@@ -60,6 +64,104 @@ create_call_free (CreateCall *call)
+@@ -60,6 +64,154 @@ create_call_free (CreateCall *call)
    g_free (call);
  }
  
@@ -39,6 +40,10 @@ index a0da823..960dfb2 100644
 +  XdpRestoreAction default_action;
 +  GHashTable *actions;
 +};
++
++G_DEFINE_BOXED_TYPE (XdpRestorePolicy, xdp_restore_policy,
++                     xdp_restore_policy_copy,
++                     xdp_restore_policy_free)
 +
 +static const char *
 +restore_failure_reason_to_string (XdpRestoreFailureReason reason)
@@ -120,6 +125,25 @@ index a0da823..960dfb2 100644
 +  policy->default_action = normalize_restore_action (action);
 +}
 +
++/**
++ * xdp_restore_policy_get_default_action:
++ * @policy: a restore policy
++ *
++ * Gets the default action for @policy.
++ *
++ * Returns: the default restore action
++ */
++XdpRestoreAction
++xdp_restore_policy_get_default_action (const XdpRestorePolicy *policy)
++{
++  g_return_val_if_fail (policy != NULL, XDP_RESTORE_ACTION_PROMPT);
++
++  if (!policy->has_default_action)
++    return XDP_RESTORE_ACTION_PROMPT;
++
++  return policy->default_action;
++}
++
 +void
 +xdp_restore_policy_set_action (XdpRestorePolicy *policy,
 +                               XdpRestoreFailureReason reason,
@@ -132,10 +156,37 @@ index a0da823..960dfb2 100644
 +                       GUINT_TO_POINTER (normalize_restore_action (action)));
 +}
 +
++/**
++ * xdp_restore_policy_get_action:
++ * @policy: a restore policy
++ * @reason: a restore failure reason
++ *
++ * Gets the action for @reason in @policy.
++ *
++ * Returns: the reason-specific action, or the default restore action when
++ *   @policy has no action for @reason
++ */
++XdpRestoreAction
++xdp_restore_policy_get_action (const XdpRestorePolicy *policy,
++                               XdpRestoreFailureReason reason)
++{
++  gpointer value = NULL;
++
++  g_return_val_if_fail (policy != NULL, XDP_RESTORE_ACTION_PROMPT);
++
++  if (g_hash_table_lookup_extended (policy->actions,
++                                    restore_failure_reason_to_string (reason),
++                                    NULL,
++                                    &value))
++    return GPOINTER_TO_UINT (value);
++
++  return xdp_restore_policy_get_default_action (policy);
++}
++
  static void
  sources_selected (GDBusConnection *bus,
                    const char *sender_name,
-@@ -84,10 +186,39 @@ sources_selected (GDBusConnection *bus,
+@@ -84,10 +236,39 @@ sources_selected (GDBusConnection *bus,
        session = _xdp_session_new (call->portal, call->id, call->type);
        g_task_return_pointer (call->task, session, g_object_unref);
      }
@@ -179,7 +230,7 @@ index a0da823..960dfb2 100644
  
    create_call_free (call);
  }
-@@ -141,6 +272,44 @@ select_sources (CreateCall *call)
+@@ -141,6 +322,47 @@ select_sources (CreateCall *call)
        if (call->restore_token)
          g_variant_builder_add (&options, "{sv}", "restore_token", g_variant_new_string (call->restore_token));
      }
@@ -193,14 +244,17 @@ index a0da823..960dfb2 100644
 +          GVariantBuilder policy;
 +          GHashTableIter iter;
 +          gpointer key, value;
++          gboolean has_actions;
 +
 +          g_variant_builder_init (&policy, G_VARIANT_TYPE_VARDICT);
-+          if (call->restore_policy->has_default_action)
++          has_actions = g_hash_table_size (call->restore_policy->actions) > 0;
++          if (call->restore_policy->has_default_action &&
++              (call->restore_policy->default_action != XDP_RESTORE_ACTION_PROMPT || has_actions))
 +            g_variant_builder_add (&policy, "{sv}",
 +                                   "default_action",
 +                                   g_variant_new_uint32 (call->restore_policy->default_action));
 +
-+          if (g_hash_table_size (call->restore_policy->actions) > 0)
++          if (has_actions)
 +            {
 +              GVariantBuilder actions;
 +
@@ -224,7 +278,7 @@ index a0da823..960dfb2 100644
    g_dbus_connection_call (call->portal->bus,
                            PORTAL_BUS_NAME,
                            PORTAL_OBJECT_PATH,
-@@ -453,6 +622,55 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
+@@ -453,6 +675,55 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
                                        GCancellable *cancellable,
                                        GAsyncReadyCallback  callback,
                                        gpointer data)
@@ -280,35 +334,36 @@ index a0da823..960dfb2 100644
  {
    CreateCall *call;
  
-@@ -467,6 +685,27 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
+@@ -467,8 +738,27 @@ xdp_portal_create_screencast_session (XdpPortal *portal,
    call->cursor_mode = cursor_mode;
    call->persist_mode = persist_mode;
    call->restore_token = g_strdup (restore_token);
+-  call->multiple = (flags & XDP_SCREENCAST_FLAG_MULTIPLE) != 0;
+   call->task = g_task_new (portal, cancellable, callback, data);
 +  if (source_label != NULL && *source_label != '\0')
 +    {
 +      gsize len = strlen (source_label);
 +
 +      if (len > 256)
 +        {
-+          const char *end = source_label + 256;
-+          const char *safe = g_utf8_find_prev_char (source_label, end);
++          g_task_return_new_error (call->task,
++                                   G_IO_ERROR,
++                                   G_IO_ERROR_INVALID_ARGUMENT,
++                                   "source_label exceeds 256 bytes (%zu)",
++                                   len);
++          create_call_free (call);
++          return;
++        }
 +
-+          if (safe != NULL && safe >= source_label)
-+            call->source_label = g_strndup (source_label, safe - source_label);
-+          else
-+            call->source_label = g_strndup (source_label, 256);
-+        }
-+      else
-+        {
-+          call->source_label = g_strdup (source_label);
-+        }
++      call->source_label = g_strdup (source_label);
 +    }
 +
 +  call->restore_policy = xdp_restore_policy_copy (restore_policy);
-   call->multiple = (flags & XDP_SCREENCAST_FLAG_MULTIPLE) != 0;
-   call->task = g_task_new (portal, cancellable, callback, data);
++  call->multiple = (flags & XDP_SCREENCAST_FLAG_MULTIPLE) != 0;
  
-@@ -680,14 +919,40 @@ session_started (GDBusConnection *bus,
+   if (portal->screencast_interface_version == 0)
+     get_screencast_interface_version (call);
+@@ -680,14 +970,40 @@ session_started (GDBusConnection *bus,
  
        g_task_return_boolean (call->task, TRUE);
      }
@@ -358,10 +413,10 @@ index a0da823..960dfb2 100644
    start_call_free (call);
  }
 diff --git a/libportal/remote.h b/libportal/remote.h
-index e5e75cb..2123ccf 100644
+index e5e75cb..92ed4d5 100644
 --- a/libportal/remote.h
 +++ b/libportal/remote.h
-@@ -110,6 +110,48 @@ typedef enum {
+@@ -110,6 +110,60 @@ typedef enum {
    XDP_PERSIST_MODE_PERSISTENT,
  } XdpPersistMode;
  
@@ -389,6 +444,11 @@ index e5e75cb..2123ccf 100644
 +
 +typedef struct _XdpRestorePolicy XdpRestorePolicy;
 +
++#define XDP_TYPE_RESTORE_POLICY (xdp_restore_policy_get_type ())
++
++XDP_PUBLIC
++GType             xdp_restore_policy_get_type           (void);
++
 +XDP_PUBLIC
 +XdpRestorePolicy *xdp_restore_policy_new                (void);
 +
@@ -403,14 +463,21 @@ index e5e75cb..2123ccf 100644
 +                                                         XdpRestoreAction           action);
 +
 +XDP_PUBLIC
++XdpRestoreAction  xdp_restore_policy_get_default_action (const XdpRestorePolicy    *policy);
++
++XDP_PUBLIC
 +void              xdp_restore_policy_set_action         (XdpRestorePolicy          *policy,
 +                                                         XdpRestoreFailureReason    reason,
 +                                                         XdpRestoreAction           action);
 +
++XDP_PUBLIC
++XdpRestoreAction  xdp_restore_policy_get_action         (const XdpRestorePolicy    *policy,
++                                                         XdpRestoreFailureReason    reason);
++
  XDP_PUBLIC
  void        xdp_portal_create_screencast_session            (XdpPortal            *portal,
                                                               XdpOutputType         outputs,
-@@ -121,6 +163,19 @@ void        xdp_portal_create_screencast_session            (XdpPortal
+@@ -121,6 +175,19 @@ void        xdp_portal_create_screencast_session            (XdpPortal
                                                               GAsyncReadyCallback   callback,
                                                               gpointer              data);
  
@@ -431,5 +498,5 @@ index e5e75cb..2123ccf 100644
  XdpSession *xdp_portal_create_screencast_session_finish     (XdpPortal            *portal,
                                                               GAsyncResult         *result,
 -- 
-2.53.0
+2.54.0
 
