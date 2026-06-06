@@ -1,45 +1,127 @@
 From c90d74367a0c740ae990a65adb8c9833072ed3a9 Mon Sep 17 00:00:00 2001
 From: "Can H. Tartanoglu" <gpg@rotas.mozmail.com>
 Date: Tue, 17 Mar 2026 09:50:14 +0100
-Subject: [PATCH] screencast: display source_label in share picker
+Subject: [PATCH] screencast: sanitize source_label for share picker
 
+Signed-off-by: Can H. Tartanoglu <gpg@rotas.mozmail.com>
 ---
- src/portals/Screencopy.cpp      | 7 ++++++-
+ src/portals/Screencopy.cpp      | 80 ++++++++++++++++++++++++++++++++-
  src/shared/ScreencopyShared.cpp | 4 +++-
  src/shared/ScreencopyShared.hpp | 2 +-
- 3 files changed, 10 insertions(+), 3 deletions(-)
+ 3 files changed, 83 insertions(+), 3 deletions(-)
 
 diff --git a/src/portals/Screencopy.cpp b/src/portals/Screencopy.cpp
 index c74699b..cc7930f 100644
 --- a/src/portals/Screencopy.cpp
 +++ b/src/portals/Screencopy.cpp
-@@ -97,6 +97,8 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
+@@ -35,6 +35,74 @@ static sdbus::Struct<std::string, uint32_t, sdbus::Variant> getFullRestoreStruct
+     return sdbus::Struct<std::string, uint32_t, sdbus::Variant>{"hyprland", 3, restoreData};
+ }
+
++constexpr static size_t SOURCE_LABEL_MAX_BYTES = 256;
++
++static bool isLabelControlChar(uint32_t codepoint) {
++    return codepoint <= 0x1F || codepoint == 0x7F || (codepoint >= 0x200E && codepoint <= 0x200F) || (codepoint >= 0x202A && codepoint <= 0x202E) ||
++        (codepoint >= 0x2066 && codepoint <= 0x2069);
++}
++
++static bool readUtf8Codepoint(const std::string& input, size_t offset, uint32_t& codepoint, size_t& length) {
++    const auto lead = static_cast<unsigned char>(input[offset]);
++
++    if (lead < 0x80) {
++        codepoint = lead;
++        length    = 1;
++        return true;
++    }
++
++    if ((lead & 0xE0) == 0xC0) {
++        codepoint = lead & 0x1F;
++        length    = 2;
++    } else if ((lead & 0xF0) == 0xE0) {
++        codepoint = lead & 0x0F;
++        length    = 3;
++    } else if ((lead & 0xF8) == 0xF0) {
++        codepoint = lead & 0x07;
++        length    = 4;
++    } else
++        return false;
++
++    if (offset + length > input.size())
++        return false;
++
++    for (size_t i = 1; i < length; ++i) {
++        const auto byte = static_cast<unsigned char>(input[offset + i]);
++        if ((byte & 0xC0) != 0x80)
++            return false;
++        codepoint = (codepoint << 6) | (byte & 0x3F);
++    }
++
++    if ((length == 2 && codepoint < 0x80) || (length == 3 && codepoint < 0x800) || (length == 4 && codepoint < 0x10000) || codepoint > 0x10FFFF ||
++        (codepoint >= 0xD800 && codepoint <= 0xDFFF))
++        return false;
++
++    return true;
++}
++
++static std::string sanitizeSourceLabel(const std::string& input) {
++    std::string result;
++    result.reserve(std::min(input.size(), SOURCE_LABEL_MAX_BYTES));
++
++    for (size_t i = 0; i < input.size();) {
++        uint32_t codepoint = 0;
++        size_t   length    = 0;
++        if (!readUtf8Codepoint(input, i, codepoint, length)) {
++            ++i;
++            continue;
++        }
++
++        if (!isLabelControlChar(codepoint)) {
++            if (result.size() + length > SOURCE_LABEL_MAX_BYTES)
++                break;
++            result.append(input, i, length);
++        }
++        i += length;
++    }
++
++    return result;
++}
++
+ dbUasv CScreencopyPortal::onCreateSession(sdbus::ObjectPath requestHandle, sdbus::ObjectPath sessionHandle, std::string appID,
+                                           std::unordered_map<std::string, sdbus::Variant> opts) {
+     g_pPortalManager->m_sHelpers.toplevel->activate();
+@@ -97,6 +165,8 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
          } geometry;
      } restoreData;
- 
+
 +    std::string sourceLabel;
 +
      for (auto& [key, val] : options) {
- 
+
          if (key == "cursor_mode") {
-@@ -175,6 +177,9 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
+@@ -159,6 +229,15 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
          } else if (key == "persist_mode") {
              PSESSION->persistMode = val.get<uint32_t>();
              Debug::log(LOG, "[screencopy] option persist_mode to {}", PSESSION->persistMode);
 +        } else if (key == "source_label") {
-+            sourceLabel = val.get<std::string>();
++            try {
++                sourceLabel = sanitizeSourceLabel(val.get<std::string>());
++            } catch (const std::exception&) {
++                sourceLabel.clear();
++                Debug::log(LOG, "[screencopy] option source_label ignored: value is not a string");
++                continue;
++            }
 +            Debug::log(LOG, "[screencopy] option source_label: {}", sourceLabel);
          } else {
              Debug::log(LOG, "[screencopy] unused option {}", key);
          }
-@@ -212,7 +217,7 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
+@@ -188,7 +267,7 @@ dbUasv CScreencopyPortal::onSelectSources(sdbus::ObjectPath requestHandle, sdbus
      } else {
          Debug::log(LOG, "[screencopy] restore data invalid / missing, prompting");
- 
+
 -        SHAREDATA = promptForScreencopySelection();
 +        SHAREDATA = promptForScreencopySelection(sourceLabel);
      }
- 
+
      Debug::log(LOG, "[screencopy] SHAREDATA returned selection {}", (int)SHAREDATA.type);
 diff --git a/src/shared/ScreencopyShared.cpp b/src/shared/ScreencopyShared.cpp
 index c5db2bc..caf55ad 100644
@@ -48,11 +130,11 @@ index c5db2bc..caf55ad 100644
 @@ -39,7 +39,7 @@ std::string buildWindowList() {
      return result;
  }
- 
+
 -SSelectionData promptForScreencopySelection() {
 +SSelectionData promptForScreencopySelection(const std::string& sourceLabel) {
      SSelectionData      data;
- 
+
      const char*         WAYLAND_DISPLAY             = getenv("WAYLAND_DISPLAY");
 @@ -60,6 +60,8 @@ SSelectionData promptForScreencopySelection() {
      proc.addEnv("XCURSOR_SIZE", XCURSOR_SIZE ? XCURSOR_SIZE : "24");
@@ -60,7 +142,7 @@ index c5db2bc..caf55ad 100644
      proc.addEnv("XDPH_WINDOW_SHARING_LIST", buildWindowList()); // buildWindowList will sanitize any shell stuff in case the picker (qt) does something funky? It shouldn't.
 +    if (!sourceLabel.empty())
 +        proc.addEnv("XDPH_SOURCE_LABEL", sourceLabel);
- 
+
      if (!proc.runSync())
          return data;
 diff --git a/src/shared/ScreencopyShared.hpp b/src/shared/ScreencopyShared.hpp
@@ -68,14 +150,13 @@ index 95639c0..4fa6161 100644
 --- a/src/shared/ScreencopyShared.hpp
 +++ b/src/shared/ScreencopyShared.hpp
 @@ -43,7 +43,7 @@ struct SSelectionData {
- 
+
  struct wl_buffer;
- 
+
 -SSelectionData   promptForScreencopySelection();
 +SSelectionData   promptForScreencopySelection(const std::string& sourceLabel = "");
  uint32_t         drmFourccFromSHM(wl_shm_format format);
  spa_video_format pwFromDrmFourcc(uint32_t format);
  wl_shm_format    wlSHMFromDrmFourcc(uint32_t format);
--- 
+--
 2.53.0
-
