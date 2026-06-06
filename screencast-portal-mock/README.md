@@ -3,13 +3,14 @@
 A mock implementation of the [XDG Desktop Portal](https://flatpak.github.io/xdg-desktop-portal/)
 `org.freedesktop.portal.ScreenCast` interface, running on a private D-Bus session bus.
 
-Built for testing portal clients — especially the two new options proposed in the
+Built for testing portal clients — especially the new options proposed in the
 ScreenCast portal **RFC v6**:
 
 | Key | Type | Description |
 |-----|------|-------------|
 | `source_label` | `string` | Human-readable hint identifying the application-level source |
 | `restore_policy` | `a{sv}` | Per-reason restore policy with `default_action` and optional `actions` overrides |
+| `restore_match_rules` | `aa{sv}` | Optional title-regex restore aliases recorded on `SelectSources` calls |
 
 `restore_policy.default_action` and all reason-specific `actions` use `0` =
 prompt, `1` = skip, and `2` = error. Policy-triggered skip/error responses
@@ -61,6 +62,40 @@ for custom behaviour, or use one of the built-in scenarios:
 | `SlowResponse` | Wraps another scenario, adding a configurable delay |
 | `OldPortal` | Reports a lower interface version (for backward-compat testing) |
 
+Example built-in scenario values:
+
+```rust
+use std::time::Duration;
+
+use screencast_portal_mock::{
+    MultiSource, NormalSession, OldPortal, RestoreFailReason, RestoreTokenFails,
+    RestoreTokenValid, SlowResponse, SourceDef,
+};
+
+let valid_restore = RestoreTokenValid {
+    token: "restored-token".to_string(),
+    node_id: 42,
+};
+
+let restore_failure = RestoreTokenFails {
+    reason: RestoreFailReason::TokenNotFound,
+};
+
+let multi_source = MultiSource {
+    sources: vec![
+        SourceDef::monitor(1).with_label("Camera"),
+        SourceDef::monitor(2).with_label("Desktop"),
+    ],
+};
+
+let old_portal = OldPortal { version: 5 };
+
+let slow_response = SlowResponse {
+    delay: Duration::from_millis(50),
+    inner: Box::new(NormalSession),
+};
+```
+
 ### Custom scenario
 
 ```rust
@@ -94,7 +129,7 @@ helpers:
 - `assert_no_restore_policy(index)` — call at `index` has no restore policy
 - `assert_no_prompts()` — no call used `restore_policy.default_action = Prompt`
 - `wait_for_calls(n, timeout)` — async wait until `n` calls are recorded
-- `calls()` — snapshot of all recorded calls
+- `calls()` — snapshot of all recorded calls, including parsed `restore_match_rules`
 
 ## Requirements
 
