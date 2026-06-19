@@ -25,12 +25,15 @@ aliases. v1 and v2 tokens continue to deserialize with empty alias lists.
 Matching order is:
 
 1. Exact compositor identifier.
-2. Regex aliases, when the selected window's rescue mode allows title-style
+2. Exact saved app/title.
+3. Regex aliases, when the selected window's rescue mode allows title-style
    matching.
-3. Existing app/title fallback behavior.
+4. App-ID fallback for app-mode restore tokens.
 
 `same_app` requires the restored window's saved app ID to match the candidate
-window. `any_app` may match across app IDs by title.
+window. `any_app` may identify a candidate across app IDs by title, but COSMIC
+requires re-consent instead of unattended auto-restore for cross-application
+matches.
 
 OBS stores aliases as a multiline string. Each non-empty line is one regex rule:
 

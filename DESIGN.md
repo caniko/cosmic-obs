@@ -110,8 +110,8 @@ matches the saved app ID. `any_app` rules may identify a cross-application
 candidate by title, but COSMIC treats that as requiring re-consent rather than
 an unattended auto-restore. This is the confidentiality boundary: an
 application-provided regex must not silently redirect an old restore token to a
-different application's window. Phase 02 gates cross-app alias matches by
-falling back to the picker when re-consent is required.
+different application's window. COSMIC gates cross-app alias matches by falling
+back to the picker when re-consent is required.
 
 COSMIC restore tokens are vendor-private and currently have three versions.
 v1 stores outputs and exact toplevel identifiers and deserializes as exact-only
@@ -235,7 +235,7 @@ Future upstreaming work not performed by this phase:
 1. Split the COSMIC patch into a generic backend restore-policy/source-label
    part and a separate rescue UI/token-alias experiment if upstream review asks
    for a smaller surface.
-2. Recheck picker markup escaping in the XDPH path after Phase 04's
+2. Recheck picker markup escaping in the XDPH path after source-label
    sanitization, because control-character stripping does not by itself prove
    toolkit-level plain-text rendering.
 

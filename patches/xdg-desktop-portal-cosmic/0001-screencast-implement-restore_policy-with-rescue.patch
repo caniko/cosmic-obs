@@ -670,7 +670,7 @@ index b31f604..5f0636f 100644
      closed: bool,
  }
 
-@@ -161,6 +635,127 @@ impl SessionData {
+@@ -161,5 +635,150 @@ impl SessionData {
      }
  }
 
@@ -729,6 +729,30 @@ index b31f604..5f0636f 100644
 +        action,
 +        token_invalid: reason != "source_unavailable",
 +    }
++}
++
++fn restore_failure_results(
++    reason: &str,
++    action: u32,
++) -> HashMap<String, zvariant::OwnedValue> {
++    let mut failure = HashMap::new();
++    failure.insert(
++        "reason".to_string(),
++        zvariant::OwnedValue::try_from(zvariant::Value::new(reason.to_string()))
++            .expect("string must serialize as OwnedValue"),
++    );
++    failure.insert("action".to_string(), zvariant::OwnedValue::from(action));
++    failure.insert(
++        "token_invalid".to_string(),
++        zvariant::OwnedValue::from(reason != "source_unavailable"),
++    );
++
++    let mut results = HashMap::new();
++    results.insert(
++        "restore_failure".to_string(),
++        zvariant::OwnedValue::from(failure),
++    );
++    results
 +}
 +
 +fn owned_value_string(value: &zvariant::OwnedValue) -> Option<String> {
@@ -798,13 +822,34 @@ index b31f604..5f0636f 100644
  pub struct ScreenCast {
      wayland_helper: WaylandHelper,
      tx: Sender<subscription::Event>,
-@@ -223,6 +818,11 @@ impl ScreenCast {
+diff --git a/src/screencast.rs b/src/screencast.rs
+index b31f604..5f0636f 100644
+--- a/src/screencast.rs
++++ b/src/screencast.rs
+@@ -223,10 +818,28 @@ impl ScreenCast {
++                let source_unavailable_action =
++                    restore_policy_action(&options.restore_policy, "source_unavailable");
++                let token_not_found_action =
++                    restore_policy_action(&options.restore_policy, "token_not_found");
+                 if let Some(restore_data) = &options.restore_data {
+                     if let Ok(persisted_capture_sources) = restore_data.try_into() {
+                         session_data.persisted_capture_sources = Some(persisted_capture_sources);
+                     } else {
                          log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
++                        match token_not_found_action {
++                            1 => return PortalResponse::Cancelled,
++                            2 => {
++                                return PortalResponse::OtherWithResults(restore_failure_results(
++                                    "token_not_found",
++                                    token_not_found_action,
++                                ));
++                            }
++                            _ => {}
++                        }
                      }
                  }
 +                session_data.source_label = sanitize_label(options.source_label);
-+                session_data.source_unavailable_action =
-+                    restore_policy_action(&options.restore_policy, "source_unavailable");
++                session_data.source_unavailable_action = source_unavailable_action;
 +                session_data.restore_match_rules =
 +                    parse_restore_match_rules(options.restore_match_rules);
                  PortalResponse::Success(HashMap::new())
@@ -825,7 +870,7 @@ index b31f604..5f0636f 100644
 +                restore_match_rules,
 +            ) = {
                  let session_data = interface.get_mut().await;
-                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_HIDDEN);
+                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_EMBEDDED);
                  let multiple = session_data.multiple;
                  let source_types = session_data.source_types;
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
