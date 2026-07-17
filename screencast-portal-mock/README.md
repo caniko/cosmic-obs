@@ -1,5 +1,11 @@
 # screencast-portal-mock
 
+<!-- simit:badges:start -->
+
+[![Nix](https://img.shields.io/badge/Nix-managed-5277c3)](flake.nix) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/screencast-portal-mock)
+
+<!-- simit:badges:end -->
+
 A mock implementation of the [XDG Desktop Portal](https://flatpak.github.io/xdg-desktop-portal/)
 `org.freedesktop.portal.ScreenCast` interface, running on a private D-Bus session bus.
 
