@@ -870,7 +870,7 @@ index b31f604..5f0636f 100644
 +                restore_match_rules,
 +            ) = {
                  let session_data = interface.get_mut().await;
-                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_EMBEDDED);
+                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_HIDDEN);
                  let multiple = session_data.multiple;
                  let source_types = session_data.source_types;
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
