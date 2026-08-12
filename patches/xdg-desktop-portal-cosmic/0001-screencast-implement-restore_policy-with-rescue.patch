@@ -6,25 +6,29 @@ Subject: [PATCH] screencast: implement restore_policy rescue and source_label
 Signed-off-by: Can H. Tartanoglu <gpg@rotas.mozmail.com>
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 6945f9c..2005b78 100644
+index 2f25fc2..749611f 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -9138,2 +9138,3 @@ dependencies = [
+@@ -9242,6 +9242,7 @@ dependencies = [
+  "rust-embed",
+  "rustix 1.1.4",
   "serde",
 + "regex",
   "tempfile",
+  "tokio",
+  "tracing",
 diff --git a/Cargo.toml b/Cargo.toml
-index 1a5d801..b464372 100644
+index d2505a8..2f9550c 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -30,6 +30,7 @@ pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", featur
+@@ -31,6 +31,7 @@ pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs", featur
      "v0_3_33",
  ] }
  png = "0.18"
 +regex = "1.12"
  rustix = { version = "1.1", features = ["fs"] }
  # spa_sys = { package = "libspa-sys", git = "https://github.com/pop-os/pipewire-rs" }
- zbus = { version = "5.11.0", default-features = false, features = ["tokio"] }
+ zbus = { version = "5.15.0", default-features = false, features = ["tokio"] }
 diff --git a/i18n/en/xdg_desktop_portal_cosmic.ftl b/i18n/en/xdg_desktop_portal_cosmic.ftl
 index 5e6fe12..c7dc777 100644
 --- a/i18n/en/xdg_desktop_portal_cosmic.ftl
@@ -43,56 +47,54 @@ index 5e6fe12..c7dc777 100644
 +rescue-alias-add = Add alias
 +rescue-invalid-regex = Invalid regex alias
 diff --git a/src/main.rs b/src/main.rs
-index 55cf2df..fb58168 100644
+index e2a6544..f4a8476 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -35,6 +35,7 @@ enum PortalResponse<T: zvariant::Type + serde::Serialize> {
+@@ -37,6 +37,7 @@ enum PortalResponse<T: zvariant::Type + serde::Serialize> {
      Success(T),
      Cancelled,
      Other,
 +    OtherWithResults(T),
  }
-
+ 
  impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T> {
-@@ -51,6 +52,9 @@ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T
+@@ -53,6 +54,7 @@ impl<T: zvariant::Type + serde::Serialize> serde::Serialize for PortalResponse<T
                  HashMap::<String, zvariant::Value>::new(),
              )
                  .serialize(serializer),
-+            Self::OtherWithResults(res) => {
-+                (PORTAL_RESPONSE_OTHER, res).serialize(serializer)
-+            }
++            Self::OtherWithResults(res) => (PORTAL_RESPONSE_OTHER, res).serialize(serializer),
          }
      }
  }
 diff --git a/src/screencast.rs b/src/screencast.rs
-index b31f604..5f0636f 100644
+index 186f011..51df9c5 100644
 --- a/src/screencast.rs
 +++ b/src/screencast.rs
-@@ -4,13 +4,18 @@ use ashpd::enumflags2::BitFlags;
+@@ -5,13 +5,18 @@ use ashpd::enumflags2::BitFlags;
  use futures::stream::{FuturesOrdered, StreamExt};
  use std::collections::HashMap;
  use std::mem;
 +use std::time::Duration;
  use tokio::sync::mpsc::Sender;
  use zbus::zvariant;
-
+ 
 -use crate::screencast_dialog::{self, CaptureSources};
 +use crate::screencast_dialog::{
-+    self, CaptureSources, RestoreAliasSeed, RestoreMatchRule, RestoreMatchScope,
-+    MAX_RESTORE_MATCH_RULES,
++    self, CaptureSources, MAX_RESTORE_MATCH_RULES, RestoreAliasSeed, RestoreMatchRule,
++    RestoreMatchScope,
 +};
- use crate::screencast_thread::ScreencastThread;
+ use crate::screencast_thread::{CursorMode, ScreencastThread};
 -use crate::wayland::{CaptureSource, WaylandHelper};
 +use crate::wayland::{CaptureSource, RescueOutcome, WaylandHelper};
  use crate::{PortalResponse, Request, subscription};
 +use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
-
+ 
  const CURSOR_MODE_HIDDEN: u32 = 1;
  const CURSOR_MODE_EMBEDDED: u32 = 2;
-@@ -26,16 +30,27 @@ struct CreateSessionResult {
+@@ -27,16 +32,27 @@ struct CreateSessionResult {
      session_id: String,
  }
-
+ 
 +/// Rescue mode controls how the portal matches windows after an app restart.
 +pub const RESCUE_MODE_EXACT: u32 = 0;
 +pub const RESCUE_MODE_APP: u32 = 1;
@@ -108,7 +110,7 @@ index b31f604..5f0636f 100644
 +    pub rescue_modes: Vec<u32>,
 +    pub rescue_match_rules: Vec<Vec<RestoreMatchRule>>,
  }
-
+ 
  impl PersistedCaptureSources {
 -    fn from_capture_sources(
 +    pub(crate) fn from_capture_sources(
@@ -119,9 +121,9 @@ index b31f604..5f0636f 100644
      ) -> Option<Self> {
          let mut outputs = Vec::new();
          for handle in &sources.outputs {
-@@ -44,34 +59,344 @@ impl PersistedCaptureSources {
+@@ -45,34 +61,347 @@ impl PersistedCaptureSources {
          }
-
+ 
          let mut toplevels = Vec::new();
 +        let mut toplevel_app_ids = Vec::new();
 +        let mut toplevel_titles = Vec::new();
@@ -150,7 +152,7 @@ index b31f604..5f0636f 100644
 +                *rules = source_match_rules.to_vec();
 +            }
          }
-
+ 
 -        Some(Self { outputs, toplevels })
 +        Some(Self {
 +            outputs,
@@ -169,7 +171,7 @@ index b31f604..5f0636f 100644
 +        let toplevel_infos = wayland_helper.toplevels();
 +        self.to_capture_sources_with(&toplevel_infos, wayland_helper)
      }
-
+ 
 -    fn to_capture_sources(&self, wayland_helper: &WaylandHelper) -> Option<CaptureSources> {
 +    pub(crate) fn needs_consent_with(&self, toplevel_infos: &[ToplevelInfo]) -> bool {
 +        self.toplevels.iter().enumerate().any(|(i, identifier)| {
@@ -205,7 +207,7 @@ index b31f604..5f0636f 100644
          for name in &self.outputs {
              outputs.push(wayland_helper.output_for_name(name)?);
          }
-
+ 
 +        // All-or-nothing: if any toplevel fails to match, return None
 +        // and discard the (local) partial results.
          let mut toplevels = Vec::new();
@@ -234,7 +236,7 @@ index b31f604..5f0636f 100644
 +                    toplevels.push(info.foreign_toplevel.clone());
 +                }
 +                Some(ToplevelMatch::NeedsConsent) => {
-+                    log::info!(
++                    tracing::info!(
 +                        "restore: title alias matched outside unattended rescue boundary for app_id={:?} title={:?}",
 +                        app_id,
 +                        title,
@@ -243,25 +245,28 @@ index b31f604..5f0636f 100644
 +                }
 +                None => {
 +                    if mode == RESCUE_MODE_EXACT {
-+                        log::debug!("restore: exact match failed for identifier={}", identifier);
++                        tracing::debug!(
++                            "restore: exact match failed for identifier={}",
++                            identifier
++                        );
 +                    } else if mode == RESCUE_MODE_TITLE {
 +                        if let Some(aid) = app_id {
 +                            if !aid.is_empty() && toplevel_infos.iter().any(|ti| ti.app_id == *aid)
 +                            {
-+                                log::debug!(
++                                tracing::debug!(
 +                                    "restore: app_id={} matched but title={:?} did not",
 +                                    aid,
 +                                    title,
 +                                );
 +                            }
 +                        }
-+                        log::debug!(
++                        tracing::debug!(
 +                            "restore: title match failed for app_id={:?} title={:?}",
 +                            app_id,
 +                            title,
 +                        );
 +                    } else {
-+                        log::debug!("restore: app match failed for app_id={:?}", app_id);
++                        tracing::debug!("restore: app match failed for app_id={:?}", app_id);
 +                    }
 +                    return None;
 +                }
@@ -355,9 +360,10 @@ index b31f604..5f0636f 100644
 +            {
 +                return Some(ToplevelMatch::Auto(info));
 +            }
-+        }
+         }
 +    }
-+
+ 
+-        Some(CaptureSources { outputs, toplevels })
 +    if mode == RESCUE_MODE_TITLE {
 +        if let Some(info) = match_title_regex_rules(rules, saved_app_id, toplevel_infos) {
 +            return Some(ToplevelMatch::Auto(info));
@@ -366,7 +372,7 @@ index b31f604..5f0636f 100644
 +            return Some(ToplevelMatch::NeedsConsent);
 +        }
 +        return None;
-+    }
+     }
 +
 +    // Mode 1 (App): app_id only, after exact identifier/title specificity.
 +    if let Some(app_id) = saved_app_id {
@@ -415,7 +421,7 @@ index b31f604..5f0636f 100644
 +                }
 +                needs_consent = true;
 +            }
-         }
++        }
 +        if needs_consent {
 +            return Some(MatchDecision::NeedsConsent);
 +        }
@@ -428,8 +434,7 @@ index b31f604..5f0636f 100644
 +    }
 +    None
 +}
-
--        Some(CaptureSources { outputs, toplevels })
++
 +fn title_regex_rules_need_consent(
 +    rules: &[RestoreMatchRule],
 +    saved_app_id: Option<&str>,
@@ -466,13 +471,13 @@ index b31f604..5f0636f 100644
 +        if app_id.is_empty() || candidate_app_id != app_id {
 +            return false;
 +        }
-     }
++    }
 +
 +    rule.is_match(candidate_title)
  }
-
+ 
  #[derive(Debug, serde::Serialize, serde::Deserialize, zvariant::Type)]
-@@ -86,10 +411,33 @@ impl From<PersistedCaptureSources> for RestoreData {
+@@ -87,10 +416,33 @@ impl From<PersistedCaptureSources> for RestoreData {
      fn from(sources: PersistedCaptureSources) -> RestoreData {
          RestoreData {
              vendor: "COSMIC".to_string(),
@@ -507,7 +512,7 @@ index b31f604..5f0636f 100644
              )))
              .try_to_owned()
              .unwrap(),
-@@ -100,12 +448,124 @@ impl From<PersistedCaptureSources> for RestoreData {
+@@ -101,12 +453,124 @@ impl From<PersistedCaptureSources> for RestoreData {
  impl TryFrom<&RestoreData> for PersistedCaptureSources {
      type Error = ();
      fn try_from(restore_data: &RestoreData) -> Result<Self, ()> {
@@ -593,14 +598,14 @@ index b31f604..5f0636f 100644
 +                    let mut rules = Vec::new();
 +                    for (pattern, scope) in patterns.into_iter().zip(scopes.into_iter()) {
 +                        if rules.len() >= MAX_RESTORE_MATCH_RULES {
-+                            log::warn!(
++                            tracing::warn!(
 +                                "restore: dropping title_regex rules beyond limit {}",
 +                                MAX_RESTORE_MATCH_RULES
 +                            );
 +                            continue;
 +                        }
 +                        let Some(scope) = RestoreMatchScope::from_str(&scope) else {
-+                            log::warn!(
++                            tracing::warn!(
 +                                "restore: ignoring title_regex rule with invalid scope {:?}",
 +                                scope
 +                            );
@@ -609,7 +614,7 @@ index b31f604..5f0636f 100644
 +                        let rule = match RestoreMatchRule::new(pattern, scope) {
 +                            Ok(rule) => rule,
 +                            Err(err) => {
-+                                log::warn!(
++                                tracing::warn!(
 +                                    "restore: ignoring malformed title_regex rule: {}",
 +                                    err
 +                                );
@@ -634,8 +639,8 @@ index b31f604..5f0636f 100644
 +        }
      }
  }
-
-@@ -122,6 +582,16 @@ struct SelectSourcesOptions {
+ 
+@@ -123,6 +587,16 @@ struct SelectSourcesOptions {
      restore_data: Option<RestoreData>,
      // Default: 0
      persist_mode: Option<u32>,
@@ -650,17 +655,17 @@ index b31f604..5f0636f 100644
 +    action: u32,
 +    token_invalid: bool,
  }
-
+ 
  #[derive(Clone, zvariant::SerializeDict, zvariant::Type)]
-@@ -140,6 +610,7 @@ struct StartResult {
+@@ -141,6 +615,7 @@ struct StartResult {
      streams: Vec<(u32, StreamProps)>,
      persist_mode: Option<u32>,
      restore_data: Option<RestoreData>,
 +    restore_failure: Option<RestoreFailureResult>,
  }
-
+ 
  #[derive(Default)]
-@@ -149,6 +620,9 @@ struct SessionData {
+@@ -150,6 +625,9 @@ struct SessionData {
      multiple: bool,
      source_types: BitFlags<SourceType>,
      persisted_capture_sources: Option<PersistedCaptureSources>,
@@ -669,11 +674,11 @@ index b31f604..5f0636f 100644
 +    restore_match_rules: Vec<RestoreMatchRule>,
      closed: bool,
  }
-
-@@ -161,5 +635,150 @@ impl SessionData {
+ 
+@@ -162,6 +640,151 @@ impl SessionData {
      }
  }
-
+ 
 +/// Sanitize a user-provided label per the ScreenCast v6 spec:
 +/// strip control characters, truncate to 256 bytes, normalize empty to None.
 +fn sanitize_label(input: Option<String>) -> Option<String> {
@@ -731,10 +736,7 @@ index b31f604..5f0636f 100644
 +    }
 +}
 +
-+fn restore_failure_results(
-+    reason: &str,
-+    action: u32,
-+) -> HashMap<String, zvariant::OwnedValue> {
++fn restore_failure_results(reason: &str, action: u32) -> HashMap<String, zvariant::OwnedValue> {
 +    let mut failure = HashMap::new();
 +    failure.insert(
 +        "reason".to_string(),
@@ -765,7 +767,7 @@ index b31f604..5f0636f 100644
 +    let mut parsed = Vec::new();
 +    for rule in rules.unwrap_or_default() {
 +        if parsed.len() >= MAX_RESTORE_MATCH_RULES {
-+            log::warn!(
++            tracing::warn!(
 +                "restore: dropping external title_regex rules beyond limit {}",
 +                MAX_RESTORE_MATCH_RULES
 +            );
@@ -800,7 +802,7 @@ index b31f604..5f0636f 100644
 +        Some(scope) => match RestoreMatchScope::from_str(scope) {
 +            Some(scope) => scope,
 +            None => {
-+                log::warn!(
++                tracing::warn!(
 +                    "restore: ignoring title_regex rule with invalid scope {:?}",
 +                    scope
 +                );
@@ -813,7 +815,10 @@ index b31f604..5f0636f 100644
 +    match RestoreMatchRule::new(pattern, scope) {
 +        Ok(rule) => Some(rule),
 +        Err(err) => {
-+            log::warn!("restore: ignoring invalid external title_regex rule: {}", err);
++            tracing::warn!(
++                "restore: ignoring invalid external title_regex rule: {}",
++                err
++            );
 +            None
 +        }
 +    }
@@ -822,11 +827,10 @@ index b31f604..5f0636f 100644
  pub struct ScreenCast {
      wayland_helper: WaylandHelper,
      tx: Sender<subscription::Event>,
-diff --git a/src/screencast.rs b/src/screencast.rs
-index b31f604..5f0636f 100644
---- a/src/screencast.rs
-+++ b/src/screencast.rs
-@@ -223,10 +818,28 @@ impl ScreenCast {
+@@ -226,13 +849,31 @@ impl ScreenCast {
+                 if session_data.source_types.is_empty() {
+                     session_data.source_types = SourceType::Monitor.into();
+                 }
 +                let source_unavailable_action =
 +                    restore_policy_action(&options.restore_policy, "source_unavailable");
 +                let token_not_found_action =
@@ -835,7 +839,7 @@ index b31f604..5f0636f 100644
                      if let Ok(persisted_capture_sources) = restore_data.try_into() {
                          session_data.persisted_capture_sources = Some(persisted_capture_sources);
                      } else {
-                         log::warn!("unrecognized screencopy restore data: {:?}", restore_data);
+                         tracing::warn!("unrecognized screencopy restore data: {:?}", restore_data);
 +                        match token_not_found_action {
 +                            1 => return PortalResponse::Cancelled,
 +                            2 => {
@@ -855,10 +859,10 @@ index b31f604..5f0636f 100644
                  PortalResponse::Success(HashMap::new())
              }
              None => PortalResponse::Other,
-@@ -246,17 +846,31 @@ impl ScreenCast {
+@@ -256,17 +897,31 @@ impl ScreenCast {
                  return PortalResponse::Other;
              };
-
+ 
 -            let (cursor_mode, multiple, source_types, persisted_capture_sources) = {
 +            let (
 +                cursor_mode,
@@ -870,7 +874,7 @@ index b31f604..5f0636f 100644
 +                restore_match_rules,
 +            ) = {
                  let session_data = interface.get_mut().await;
-                 let cursor_mode = session_data.cursor_mode.unwrap_or(CURSOR_MODE_EMBEDDED);
+                 let cursor_mode = session_data.cursor_mode.unwrap_or(CursorMode::Embedded);
                  let multiple = session_data.multiple;
                  let source_types = session_data.source_types;
                  let persisted_capture_sources = session_data.persisted_capture_sources.clone();
@@ -887,10 +891,10 @@ index b31f604..5f0636f 100644
 +                    restore_match_rules,
                  )
              };
-
-@@ -268,11 +882,121 @@ impl ScreenCast {
+ 
+@@ -278,11 +933,121 @@ impl ScreenCast {
              }
-
+ 
              let capture_sources = if let Some(capture_sources) =
 -                persisted_capture_sources.and_then(|x| x.to_capture_sources(&self.wayland_helper))
 +                persisted_capture_sources
@@ -902,7 +906,7 @@ index b31f604..5f0636f 100644
 +            } else if let Some(persisted) = &persisted_capture_sources {
 +                match source_unavailable_action {
 +                    1 | 2 => {
-+                        log::info!(
++                        tracing::info!(
 +                            "restore source unavailable, action={}, registering rescue (source_label={:?})",
 +                            source_unavailable_action,
 +                            source_label,
@@ -910,7 +914,7 @@ index b31f604..5f0636f 100644
 +                        match self.wayland_helper.check_or_rescue(persisted) {
 +                            Ok(RescueOutcome::Sources(sources)) => sources,
 +                            Ok(RescueOutcome::NeedsConsent) => {
-+                                log::info!(
++                                tracing::info!(
 +                                    "restore rescue requires re-consent, showing picker (source_label={:?})",
 +                                    source_label,
 +                                );
@@ -942,11 +946,11 @@ index b31f604..5f0636f 100644
 +                                };
 +                                match rescue_result {
 +                                    Some(RescueOutcome::Sources(sources)) => {
-+                                        log::info!("rescue succeeded");
++                                        tracing::info!("rescue succeeded");
 +                                        sources
 +                                    }
 +                                    Some(RescueOutcome::NeedsConsent) => {
-+                                        log::info!(
++                                        tracing::info!(
 +                                            "restore rescue requires re-consent, showing picker (source_label={:?})",
 +                                            source_label,
 +                                        );
@@ -966,7 +970,7 @@ index b31f604..5f0636f 100644
 +                                        capture_sources
 +                                    }
 +                                    None => {
-+                                        log::info!(
++                                        tracing::info!(
 +                                            "rescue cancelled/failed, applying restore action={}",
 +                                            source_unavailable_action,
 +                                        );
@@ -1012,7 +1016,7 @@ index b31f604..5f0636f 100644
                  let resp = screencast_dialog::show_screencast_prompt(
                      &self.tx,
                      &session_handle,
-@@ -280,6 +1004,7 @@ impl ScreenCast {
+@@ -290,6 +1055,7 @@ impl ScreenCast {
                      multiple,
                      source_types,
                      &self.wayland_helper,
@@ -1020,10 +1024,10 @@ index b31f604..5f0636f 100644
                  )
                  .await;
                  let Some(capture_sources) = resp else {
-@@ -372,15 +1097,28 @@ impl ScreenCast {
+@@ -381,15 +1147,28 @@ impl ScreenCast {
                  .collect();
              interface.get_mut().await.screencast_threads = screencast_threads;
-
+ 
 +            // Use rescue modes from the dialog selection if available,
 +            // otherwise from existing persisted data, otherwise default
 +            let rescue_modes = if !capture_sources.rescue_modes.is_empty() {
@@ -1040,7 +1044,7 @@ index b31f604..5f0636f 100644
 +                &rescue_modes,
 +                &restore_match_rules,
              );
-
+ 
              PortalResponse::Success(StartResult {
                  streams,
                  persist_mode: None,
@@ -1049,8 +1053,8 @@ index b31f604..5f0636f 100644
              })
          })
          .await
-@@ -399,6 +1137,227 @@ impl ScreenCast {
-
+@@ -407,6 +1186,227 @@ impl ScreenCast {
+ 
      #[zbus(property, name = "version")]
      async fn version(&self) -> u32 {
 -        4
@@ -1279,7 +1283,7 @@ index b31f604..5f0636f 100644
      }
  }
 diff --git a/src/screencast_dialog.rs b/src/screencast_dialog.rs
-index 935e1cf..b1f0fd6 100644
+index ea9c3f3..fd58ebf 100644
 --- a/src/screencast_dialog.rs
 +++ b/src/screencast_dialog.rs
 @@ -1,5 +1,6 @@
@@ -1288,20 +1292,20 @@ index 935e1cf..b1f0fd6 100644
 +use crate::screencast::{RESCUE_MODE_APP, RESCUE_MODE_EXACT, RESCUE_MODE_TITLE};
  use crate::wayland::{CaptureSource, WaylandHelper};
  use crate::widget::keyboard_wrapper::KeyboardWrapper;
- use ashpd::{desktop::screencast::SourceType, enumflags2::BitFlags};
-@@ -22,6 +23,8 @@ use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
- use freedesktop_desktop_entry as fde;
- use freedesktop_desktop_entry::unicase::Ascii;
- use freedesktop_desktop_entry::{DesktopEntry, get_languages_from_env};
+ use ashpd::desktop::screencast::SourceType;
+@@ -21,6 +22,8 @@ use cosmic_client_toolkit::sctk::output::OutputInfo;
+ use cosmic_client_toolkit::toplevel_info::ToplevelInfo;
+ use fde::unicase::Ascii;
+ use fde::{DesktopEntry, get_languages_from_env};
 +use regex::{Regex, RegexBuilder};
 +use std::collections::HashMap;
  use std::mem;
  use std::sync::LazyLock;
  use tokio::sync::mpsc;
-@@ -33,6 +36,11 @@ pub static SCREENCAST_ID: LazyLock<window::Id> = LazyLock::new(window::Id::uniqu
+@@ -32,6 +35,11 @@ pub static SCREENCAST_ID: LazyLock<window::Id> = LazyLock::new(window::Id::uniqu
  pub static SCREENCAST_WIDGET_ID: LazyLock<widget::Id> =
      LazyLock::new(|| widget::Id::new("screencast".to_string()));
-
+ 
 +pub const MAX_RESTORE_MATCH_RULES: usize = 64;
 +pub const MAX_RESTORE_MATCH_PATTERN_BYTES: usize = 1024;
 +const RESTORE_MATCH_REGEX_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -1310,7 +1314,7 @@ index 935e1cf..b1f0fd6 100644
  pub async fn hide_screencast_prompt(
      subscription_tx: &mpsc::Sender<crate::subscription::Event>,
      session_handle: &zvariant::ObjectPath<'_>,
-@@ -51,6 +59,7 @@ pub async fn show_screencast_prompt(
+@@ -50,6 +58,7 @@ pub async fn show_screencast_prompt(
      multiple: bool,
      source_types: BitFlags<SourceType>,
      wayland_helper: &WaylandHelper,
@@ -1318,7 +1322,7 @@ index 935e1cf..b1f0fd6 100644
  ) -> Option<CaptureSources> {
      let locales = get_languages_from_env();
      let desktop_entries = load_desktop_entries(&locales).await;
-@@ -94,6 +103,9 @@ pub async fn show_screencast_prompt(
+@@ -96,6 +105,9 @@ pub async fn show_screencast_prompt(
          app_name,
          tx,
          capture_sources: Default::default(),
@@ -1328,16 +1332,16 @@ index 935e1cf..b1f0fd6 100644
      };
      subscription_tx
          .send(crate::subscription::Event::Screencast(args))
-@@ -135,7 +147,7 @@ enum Tab {
+@@ -143,7 +155,7 @@ enum Tab {
      Windows,
  }
-
+ 
 -#[derive(Debug, Clone)]
 +#[derive(Debug)]
  pub struct Args {
      session_handle: zvariant::ObjectPath<'static>,
      multiple: bool,
-@@ -146,6 +158,28 @@ pub struct Args {
+@@ -154,6 +166,28 @@ pub struct Args {
      // Should be oneshot, but need `Clone` bound
      tx: mpsc::Sender<Option<CaptureSources>>,
      capture_sources: CaptureSources,
@@ -1364,12 +1368,12 @@ index 935e1cf..b1f0fd6 100644
 +        }
 +    }
  }
-
+ 
  impl Args {
-@@ -158,11 +192,105 @@ impl Args {
+@@ -166,11 +200,105 @@ impl Args {
      }
  }
-
+ 
 +#[derive(Clone, Debug)]
 +pub struct RestoreMatchRule {
 +    pub pattern: String,
@@ -1470,9 +1474,9 @@ index 935e1cf..b1f0fd6 100644
 +    /// Per-toplevel title regex rescue rules (parallel with `toplevels`).
 +    pub rescue_match_rules: Vec<Vec<RestoreMatchRule>>,
  }
-
+ 
  impl CaptureSources {
-@@ -173,6 +301,8 @@ impl CaptureSources {
+@@ -181,6 +309,8 @@ impl CaptureSources {
      pub fn clear(&mut self) {
          self.outputs.clear();
          self.toplevels.clear();
@@ -1480,8 +1484,8 @@ index 935e1cf..b1f0fd6 100644
 +        self.rescue_match_rules.clear();
      }
  }
-
-@@ -181,6 +311,11 @@ pub enum Msg {
+ 
+@@ -189,6 +319,11 @@ pub enum Msg {
      ActivateTab(widget::segmented_button::Entity),
      SelectOutput(WlOutput),
      SelectToplevel(ExtForeignToplevelHandleV1),
@@ -1493,7 +1497,7 @@ index 935e1cf..b1f0fd6 100644
      Share,
      Cancel,
  }
-@@ -221,14 +356,93 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+@@ -232,14 +367,93 @@ pub fn update_msg(
                  .position(|t| t == &toplevel)
              {
                  args.capture_sources.toplevels.remove(idx);
@@ -1587,10 +1591,10 @@ index 935e1cf..b1f0fd6 100644
              if let Some(mut args) = portal.screencast_args.take() {
                  let response = mem::take(&mut args.capture_sources);
                  args.send_response(Some(response));
-@@ -245,6 +459,157 @@ pub fn update_msg(portal: &mut CosmicPortal, msg: Msg) -> cosmic::Task<crate::ap
+@@ -256,6 +470,157 @@ pub fn update_msg(
      cosmic::Task::none()
  }
-
+ 
 +fn sync_capture_aliases(args: &mut Args) {
 +    args.capture_sources.rescue_match_rules.clear();
 +    for toplevel in &args.capture_sources.toplevels {
@@ -1742,13 +1746,13 @@ index 935e1cf..b1f0fd6 100644
 +    )
 +}
 +
- pub fn update_args(portal: &mut CosmicPortal, args: Args) -> cosmic::Task<crate::app::Msg> {
-     // If the dialog is already open, cancel previous request, but re-use dialog surface
-     let command = if let Some(args) = portal.screencast_args.take() {
-@@ -356,12 +721,17 @@ fn output_button<'a>(
+ pub fn update_args(
+     portal: &mut CosmicPortal,
+     args: Args,
+@@ -365,12 +730,17 @@ fn output_thumb_button<'a>(
          .into()
  }
-
+ 
 -fn toplevel_button(
 -    label: &str,
 +fn toplevel_button<'a>(
@@ -1766,8 +1770,8 @@ index 935e1cf..b1f0fd6 100644
 +) -> cosmic::Element<'a, Msg> {
      let text = widget::text(label).class(theme::style::Text::Custom(|theme| {
          let container = theme.current_container();
-         cosmic::iced_core::widget::text::Style {
-@@ -371,9 +741,7 @@ fn toplevel_button(
+         iced::core::widget::text::Style {
+@@ -381,19 +751,101 @@ fn toplevel_button(
      let button = widget::button::custom(text)
          .width(iced::Length::Fill)
          .padding(0)
@@ -1778,7 +1782,7 @@ index 935e1cf..b1f0fd6 100644
 -        .on_press(msg);
 +        .on_press(select_msg);
      let mut children = Vec::new();
-@@ -381,9 +749,93 @@ fn toplevel_button(
+     children.push(icon.as_cosmic_icon().icon().size(24).into());
      children.push(button.into());
 -    // TODO
      if is_selected {
@@ -1872,9 +1876,9 @@ index 935e1cf..b1f0fd6 100644
 +
 +    widget::column::with_children(details).spacing(4).into()
  }
-
+ 
  pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
-@@ -395,7 +847,7 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+@@ -405,7 +857,7 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
      let cancel_button = widget::button::standard(fl!("cancel")).on_press(Msg::Cancel);
      let mut share_button =
          widget::button::standard(fl!("share")).class(cosmic::style::Button::Suggested);
@@ -1882,8 +1886,8 @@ index 935e1cf..b1f0fd6 100644
 +    if !args.capture_sources.is_empty() && !has_invalid_aliases(args) {
          share_button = share_button.on_press(Msg::Share);
      }
-
-@@ -422,15 +874,27 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+ 
+@@ -477,15 +929,27 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
              for (toplevel_info, icon) in &args.toplevels {
                  let icon = IconSource::from_unknown(icon.as_deref().unwrap_or_default());
                  let label = &toplevel_info.title;
@@ -1916,7 +1920,7 @@ index 935e1cf..b1f0fd6 100644
                  ));
              }
              if args.toplevels.len() > 8 {
-@@ -471,3 +935,50 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
+@@ -526,3 +990,50 @@ pub(crate) fn view(portal: &CosmicPortal) -> cosmic::Element<'_, Msg> {
      .min_height(1.)
      .into()
  }
@@ -1968,22 +1972,22 @@ index 935e1cf..b1f0fd6 100644
 +    }
 +}
 diff --git a/src/wayland/mod.rs b/src/wayland/mod.rs
-index a8447e9..9870b7c 100644
+index 9e2bdc1..50a159e 100644
 --- a/src/wayland/mod.rs
 +++ b/src/wayland/mod.rs
-@@ -34,6 +34,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
-
+@@ -36,6 +36,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
  pub use cosmic_client_toolkit::screencopy::{CaptureSource, Rect};
-
+ 
+ use crate::buffer;
 +use crate::screencast::PersistedCaptureSources;
 +use crate::screencast_dialog::CaptureSources;
- use crate::buffer;
-
- mod gbm_devices;
-@@ -81,12 +84,26 @@ impl DmabufHelper {
+ 
+ mod cursor_stream;
+ pub use cursor_stream::{CursorFrame, CursorStream};
+@@ -93,12 +95,26 @@ impl DmabufHelper {
      }
  }
-
+ 
 +const MAX_PENDING_RESCUES: usize = 64;
 +
 +pub enum RescueOutcome {
@@ -2007,8 +2011,8 @@ index a8447e9..9870b7c 100644
      qh: QueueHandle<AppData>,
      capturer: Capturer,
      wl_shm: wl_shm::WlShm,
-@@ -152,6 +169,38 @@ impl AppData {
-
+@@ -173,6 +189,38 @@ impl AppData {
+ 
          *self.wayland_helper.inner.toplevels.lock().unwrap() =
              self.toplevel_info_state.toplevels().cloned().collect();
 +
@@ -2045,8 +2049,8 @@ index a8447e9..9870b7c 100644
 +        }
      }
  }
-
-@@ -254,6 +303,7 @@ impl WaylandHelper {
+ 
+@@ -305,6 +353,7 @@ impl WaylandHelper {
                  output_infos: Mutex::new(HashMap::new()),
                  output_toplevels: Mutex::new(HashMap::new()),
                  toplevels: Mutex::new(Vec::new()),
@@ -2054,10 +2058,10 @@ index a8447e9..9870b7c 100644
                  qh: qh.clone(),
                  capturer: screencopy_state.capturer().clone(),
                  wl_shm: shm_state.wl_shm().clone(),
-@@ -301,6 +351,41 @@ impl WaylandHelper {
+@@ -354,6 +403,41 @@ impl WaylandHelper {
          self.inner.toplevels.lock().unwrap().clone()
      }
-
+ 
 +    /// Atomically check if persisted sources can be resolved against current
 +    /// toplevels. If not, register a rescue hook in the same lock scope.
 +    /// Returns `Ok(sources)` on immediate match, `Err(Some(rx))` if rescue
@@ -2081,7 +2085,7 @@ index a8447e9..9870b7c 100644
 +        rescues.retain(|r| !r.sender.is_closed());
 +
 +        if rescues.len() >= MAX_PENDING_RESCUES {
-+            log::warn!("pending rescue limit ({MAX_PENDING_RESCUES}) reached");
++            tracing::warn!("pending rescue limit ({MAX_PENDING_RESCUES}) reached");
 +            return Err(None);
 +        }
 +
@@ -2096,5 +2100,3 @@ index a8447e9..9870b7c 100644
      pub fn output_info(&self, output: &wl_output::WlOutput) -> Option<OutputInfo> {
          self.inner.output_infos.lock().unwrap().get(output).cloned()
      }
---
-2.54.0

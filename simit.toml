@@ -1,5 +1,6 @@
 [ci]
 provider = "actions"
-platform = "forgejo"
+platform = "github"
 runtime = "nix"
-runner = "codefloe-global"
+runner = "ubuntu-24.04"
+components = ["flake-evaluation"]

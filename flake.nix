@@ -2,7 +2,8 @@
   description = "ScreenCast portal RFC: source_label + restore_policy across the stack";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Match the temporary nixpkgs PR head used by canix so patch checks cover the consumed package.
+    nixpkgs.url = "github:caniko/nixpkgs/e7c01110d5906629683e4e05b8046fa628ca9cf5";
     flake-parts.url = "github:hercules-ci/flake-parts";
     crane.url = "github:ipetkov/crane";
     fenix = {
